@@ -2,17 +2,24 @@ package providers
 
 import (
 	"context"
+	"io"
 	"net/http"
 )
 
-// Provider is the interface every AI provider must implement.
-// The proxy handler only knows about this interface —
-// never about AnthropicProvider or OpenAIProvider directly.
-type Provider interface {
-	// Complete sends the request and returns the raw HTTP response.
-	// We return *http.Response so we can stream it directly.
-	Complete(ctx context.Context, model, prompt string, stream bool) (*http.Response, error)
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+}
 
-	// Name identifies this provider in logs and metrics.
+type Completion struct {
+	Text        string
+	Usage       Usage
+	RawMetadata map[string]any
+}
+
+type Provider interface {
+	Complete(ctx context.Context, model, prompt string, stream bool) (*http.Response, error)
+	ParseResponse(body io.Reader) (*Completion, error)
 	Name() string
+	DefaultModel() string
 }

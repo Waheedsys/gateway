@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -29,6 +30,8 @@ func NewAnthropic(apiKey string) *AnthropicProvider {
 }
 
 func (a *AnthropicProvider) Name() string { return "anthropic" }
+
+func (a *AnthropicProvider) DefaultModel() string { return "claude-sonnet-4-5" }
 
 func (a *AnthropicProvider) Complete(
 	ctx context.Context,
@@ -80,4 +83,53 @@ func (a *AnthropicProvider) Complete(
 
 	// Return the response — caller must close resp.Body
 	return resp, nil
+}
+
+type AnthropicUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+type anthropicResponse struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Usage AnthropicUsage `json:"usage"`
+}
+
+func (a *AnthropicProvider) ParseResponse(body io.Reader) (*Completion, error) {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("read provider response: %w", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		return &Completion{RawMetadata: map[string]any{"raw_body": string(bodyBytes)}}, fmt.Errorf("parse provider response metadata: %w", err)
+	}
+
+	var parsed anthropicResponse
+	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		return &Completion{RawMetadata: raw}, fmt.Errorf("parse provider response: %w", err)
+	}
+
+	var output bytes.Buffer
+	for _, block := range parsed.Content {
+		if block.Type == "text" || block.Type == "" {
+			output.WriteString(block.Text)
+		}
+	}
+	if output.Len() == 0 {
+		return &Completion{
+			Usage:       Usage{InputTokens: parsed.Usage.InputTokens, OutputTokens: parsed.Usage.OutputTokens},
+			RawMetadata: raw,
+		}, fmt.Errorf("provider response did not include text content")
+	}
+
+	return &Completion{
+		Text:        output.String(),
+		Usage:       Usage{InputTokens: parsed.Usage.InputTokens, OutputTokens: parsed.Usage.OutputTokens},
+		RawMetadata: raw,
+	}, nil
 }

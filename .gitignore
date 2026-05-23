@@ -1,0 +1,6 @@
+.env
+# Go debug binaries and executables
+_debug_bin*
+__debug_bin*
+*.exe
+*.exe~
