@@ -1,0 +1,19 @@
+# Git
+.git
+.gitignore
+
+# IDE / editor
+.vscode
+*.code-workspace
+
+# Local env (secrets are injected via docker-compose environment)
+.env
+
+# Build artefacts
+bin/
+**/__debug_bin.exe
+**/*.exe
+
+# OS noise
+Thumbs.db
+.DS_Store

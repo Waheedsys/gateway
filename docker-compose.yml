@@ -10,12 +10,44 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7-alpine
     container_name: ai_gateway_redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: ai_gateway_app
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/ai_gateway?sslmode=disable
+      REDIS_ADDR: redis:6379
+      MIGRATIONS_PATH: ./migrations
+      JWT_SECRET: ${JWT_SECRET:-supersecretjwtkey123!}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
 
 volumes:
   postgres_data:
