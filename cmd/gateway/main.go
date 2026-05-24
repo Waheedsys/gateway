@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -10,7 +11,9 @@ import (
 
 	"github.com/Waheedsys/ai-gateway/internal/auth"
 	"github.com/Waheedsys/ai-gateway/internal/db"
+	"github.com/Waheedsys/ai-gateway/internal/events"
 	"github.com/Waheedsys/ai-gateway/internal/handlers"
+	"github.com/Waheedsys/ai-gateway/internal/models"
 	"github.com/Waheedsys/ai-gateway/internal/providers"
 	"github.com/Waheedsys/ai-gateway/internal/ratelimiter"
 	"github.com/Waheedsys/ai-gateway/internal/repository"
@@ -21,9 +24,10 @@ import (
 )
 
 func main() {
+	// 2. Load environment variables
 	loadEnv()
 
-	//redis
+	// 3. Redis client
 	rdb := redis.NewClient(&redis.Options{
 		Addr: os.Getenv("REDIS_ADDR"), // "localhost:6379"
 	})
@@ -43,8 +47,65 @@ func main() {
 	messageRepo := repository.NewMessageRepo(pool)
 	inferenceLogRepo := repository.NewInferenceLogRepo(pool)
 	provider := newProviderFromEnv()
-	conversationHandler := handlers.NewConversationHandler(conversationRepo, messageRepo, inferenceLogRepo, provider)
+
+	// 1. Initialize the Event Bus ( buffered channel, background consumer)
+	bus := events.NewBus(100)
+	defer bus.Close()
+
+	conversationHandler := handlers.NewConversationHandler(conversationRepo, messageRepo, inferenceLogRepo, provider, bus)
 	ingestionHandler := handlers.NewIngestionHandler(inferenceLogRepo)
+
+	bus.Subscribe(func(e events.Event) {
+		ctx := context.Background() // handler ctx is already done by now
+
+		switch e.Type {
+
+		case events.EventInferenceCompleted:
+			p := e.Payload.(events.InferenceCompletedPayload)
+			respondedAt := p.RespondedAt
+			_, err := inferenceLogRepo.Create(ctx, &models.InferenceLog{
+				ConversationID:   p.ConversationID,
+				MessageID:        p.UserMessageID,
+				Provider:         p.Provider,
+				Model:            p.Model,
+				Status:           "success",
+				LatencyMs:        p.LatencyMs,
+				InputPreview:     p.InputPreview,
+				OutputPreview:    p.OutputPreview,
+				PromptTokens:     p.PromptTokens,
+				CompletionTokens: p.CompletionTokens,
+				TotalTokens:      p.TotalTokens,
+				RawMetadata:      p.RawMetadata,
+				RequestedAt:      p.RequestedAt,
+				RespondedAt:      &respondedAt,
+			})
+			fmt.Println("-------", err)
+			if err != nil {
+				log.Printf("[events] failed to save inference log: %v", err)
+			}
+
+		case events.EventInferenceFailed:
+			p := e.Payload.(events.InferenceFailedPayload)
+			respondedAt := p.RespondedAt
+			_, err := inferenceLogRepo.Create(ctx, &models.InferenceLog{
+				ConversationID: p.ConversationID,
+				MessageID:      p.UserMessageID,
+				Provider:       p.Provider,
+				Model:          p.Model,
+				Status:         "error",
+				LatencyMs:      p.LatencyMs,
+				InputPreview:   p.InputPreview,
+				ErrorMessage:   p.ErrorMessage,
+				RawMetadata:    p.RawMetadata,
+				RequestedAt:    p.RequestedAt,
+				RespondedAt:    &respondedAt,
+			})
+			fmt.Println("-------", err)
+			if err != nil {
+				log.Printf("[events] failed to save failed inference log: %v", err)
+			}
+		}
+	})
 
 	//chi router
 	r := chi.NewRouter()

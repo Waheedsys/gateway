@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -99,6 +100,42 @@ func (o *OpenRouterProvider) ParseResponse(body io.Reader) (*Completion, error) 
 	}, nil
 }
 
+// ParseStreamChunk parses one SSE line from a streaming OpenRouter response.
+//
+// OpenRouter sends lines in this format:
+//
+//	data: {"id":"...","choices":[{"delta":{"content":"Hello"}}]}
+//	data: [DONE]
+//
+// We strip "data: ", detect [DONE], then unmarshal and pull out delta.content.
+// An empty line (heartbeat) returns nil, nil — the caller should skip it.
+func (o *OpenRouterProvider) ParseStreamChunk(line string) (*StreamChunk, error) {
+	// SSE lines that carry data always start with "data: "
+	if !strings.HasPrefix(line, "data: ") {
+		return nil, nil // empty line or ":comment" — skip
+	}
+	payload := strings.TrimPrefix(line, "data: ")
+
+	// [DONE] is the terminal marker sent by OpenRouter when the stream ends
+	if strings.TrimSpace(payload) == "[DONE]" {
+		return &StreamChunk{Done: true}, nil
+	}
+
+	var chunk openRouterStreamChunk
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return nil, fmt.Errorf("parse stream chunk: %w", err)
+	}
+
+	text := ""
+	if len(chunk.Choices) > 0 {
+		text = chunk.Choices[0].Delta.Content
+	}
+
+	return &StreamChunk{Text: text}, nil
+}
+
+// --- Request / response types ---
+
 type openRouterRequest struct {
 	Model    string              `json:"model"`
 	Messages []openRouterMessage `json:"messages"`
@@ -110,6 +147,7 @@ type openRouterMessage struct {
 	Content string `json:"content"`
 }
 
+// openRouterResponse is used for non-streaming (full) responses.
 type openRouterResponse struct {
 	Choices []struct {
 		Message openRouterMessage `json:"message"`
@@ -119,4 +157,14 @@ type openRouterResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+// openRouterStreamChunk is the shape of each SSE chunk during streaming.
+// Note: streaming uses "delta" (a partial update) not "message" (full content).
+type openRouterStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
 }

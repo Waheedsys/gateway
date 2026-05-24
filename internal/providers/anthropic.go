@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Waheedsys/ai-gateway/pkg/models"
@@ -133,3 +134,40 @@ func (a *AnthropicProvider) ParseResponse(body io.Reader) (*Completion, error) {
 		RawMetadata: raw,
 	}, nil
 }
+
+// ParseStreamChunk parses one SSE line from Anthropic's streaming response.
+//
+// Anthropic uses "content_block_delta" events:
+//
+//	event: content_block_delta
+//	data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+//
+// For now we handle the basic text_delta type that carries tokens.
+func (a *AnthropicProvider) ParseStreamChunk(line string) (*StreamChunk, error) {
+	if !strings.HasPrefix(line, "data: ") {
+		return nil, nil // event: lines, empty lines — skip
+	}
+	payload := strings.TrimPrefix(line, "data: ")
+
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		return nil, nil // non-JSON heartbeat — skip
+	}
+
+	// Anthropic signals end of stream with message_stop
+	if raw["type"] == "message_stop" {
+		return &StreamChunk{Done: true}, nil
+	}
+
+	// Extract text from content_block_delta events
+	if raw["type"] == "content_block_delta" {
+		if delta, ok := raw["delta"].(map[string]any); ok {
+			if text, ok := delta["text"].(string); ok {
+				return &StreamChunk{Text: text}, nil
+			}
+		}
+	}
+
+	return nil, nil // any other event type — skip
+}
+

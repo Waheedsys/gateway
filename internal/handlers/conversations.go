@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/Waheedsys/ai-gateway/internal/events"
 	"github.com/Waheedsys/ai-gateway/internal/models"
 	"github.com/Waheedsys/ai-gateway/internal/providers"
 	"github.com/Waheedsys/ai-gateway/internal/repository"
@@ -17,14 +20,16 @@ type ConversationHandler struct {
 	messages      *repository.MessageRepo
 	inferenceLogs *repository.InferenceLog
 	provider      providers.Provider
+	bus           *events.Bus
 }
 
-func NewConversationHandler(conversations *repository.Conversation, messages *repository.MessageRepo, inferenceLogs *repository.InferenceLog, provider providers.Provider) *ConversationHandler {
+func NewConversationHandler(conversations *repository.Conversation, messages *repository.MessageRepo, inferenceLogs *repository.InferenceLog, provider providers.Provider, bus *events.Bus) *ConversationHandler {
 	return &ConversationHandler{
 		conversations: conversations,
 		messages:      messages,
 		inferenceLogs: inferenceLogs,
 		provider:      provider,
+		bus:           bus,
 	}
 }
 
@@ -51,12 +56,12 @@ type createMessageRequest struct {
 type inferenceRequest struct {
 	Content string `json:"content"`
 	Model   string `json:"model"`
+	Stream  *bool  `json:"stream,omitempty"`
 }
 
 type inferenceResponse struct {
-	UserMessage      *models.Message      `json:"user_message"`
-	AssistantMessage *models.Message      `json:"assistant_message,omitempty"`
-	InferenceLog     *models.InferenceLog `json:"inference_log"`
+	UserMessage      *models.Message `json:"user_message"`
+	AssistantMessage *models.Message `json:"assistant_message,omitempty"`
 }
 
 func (h *ConversationHandler) CreateConversation(w http.ResponseWriter, r *http.Request) {
@@ -172,6 +177,11 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 		req.Model = h.provider.DefaultModel()
 	}
 
+	stream := true
+	if req.Stream != nil {
+		stream = *req.Stream
+	}
+
 	userMessage, err := h.messages.Create(r.Context(), conversationID, models.RoleUser, req.Content)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store user message")
@@ -186,24 +196,188 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 
 	prompt := buildContextPrompt(history)
 	requestedAt := time.Now().UTC()
+
+	if stream {
+		upstream, err := h.provider.Complete(r.Context(), req.Model, prompt, true)
+		respondedAt := time.Now().UTC()
+		latencyMs := int(respondedAt.Sub(requestedAt).Milliseconds())
+		if err != nil {
+			h.bus.Publish(events.Event{
+				Type:      events.EventInferenceFailed,
+				OccuredAt: time.Now().UTC(),
+				Payload: events.InferenceFailedPayload{
+					ConversationID: conversationID,
+					UserMessageID:  userMessage.ID,
+					Provider:       h.provider.Name(),
+					Model:          req.Model,
+					LatencyMs:      latencyMs,
+					InputPreview:   preview(req.Content, 200),
+					ErrorMessage:   err.Error(),
+					RawMetadata:    map[string]any{"error": err.Error()},
+					RequestedAt:    requestedAt,
+					RespondedAt:    respondedAt,
+				},
+			})
+			fmt.Println("-------", err)
+			writeJSON(w, http.StatusBadGateway, inferenceResponse{UserMessage: userMessage})
+			return
+		}
+		defer upstream.Body.Close()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, canFlush := w.(http.Flusher)
+
+		// Send initial user message event
+		startPayload, _ := json.Marshal(map[string]any{
+			"event":        "start",
+			"user_message": userMessage,
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", startPayload)
+		if canFlush {
+			flusher.Flush()
+		}
+
+		scanner := bufio.NewScanner(upstream.Body)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // up to 1MB lines
+		var accumulatedText strings.Builder
+		var scanErr error
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			line = strings.TrimSuffix(line, "\r")
+
+			chunk, err := h.provider.ParseStreamChunk(line)
+			if err != nil {
+				// skip or report error
+				continue
+			}
+			if chunk == nil {
+				continue
+			}
+			if chunk.Done {
+				break
+			}
+			if chunk.Text != "" {
+				accumulatedText.WriteString(chunk.Text)
+				textPayload, _ := json.Marshal(map[string]any{
+					"event": "text",
+					"text":  chunk.Text,
+				})
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", textPayload)
+				if canFlush {
+					flusher.Flush()
+				}
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			scanErr = err
+		}
+
+		responseText := accumulatedText.String()
+		respondedAt = time.Now().UTC()
+		latencyMs = int(respondedAt.Sub(requestedAt).Milliseconds())
+
+		if scanErr != nil {
+			h.bus.Publish(events.Event{
+				Type:      events.EventInferenceFailed,
+				OccuredAt: time.Now().UTC(),
+				Payload: events.InferenceFailedPayload{
+					ConversationID: conversationID,
+					UserMessageID:  userMessage.ID,
+					Provider:       h.provider.Name(),
+					Model:          req.Model,
+					LatencyMs:      latencyMs,
+					InputPreview:   preview(req.Content, 200),
+					ErrorMessage:   scanErr.Error(),
+					RawMetadata:    map[string]any{"error": scanErr.Error()},
+					RequestedAt:    requestedAt,
+					RespondedAt:    respondedAt,
+				},
+			})
+			errorPayload, _ := json.Marshal(map[string]any{
+				"event": "error",
+				"error": scanErr.Error(),
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", errorPayload)
+			if canFlush {
+				flusher.Flush()
+			}
+			return
+		}
+
+		assistantMessage, err := h.messages.Create(r.Context(), conversationID, models.RoleAssistant, responseText)
+		if err != nil {
+			errorPayload, _ := json.Marshal(map[string]any{
+				"event": "error",
+				"error": "failed to store assistant message",
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", errorPayload)
+			if canFlush {
+				flusher.Flush()
+			}
+			return
+		}
+
+		h.bus.Publish(events.Event{
+			Type:      events.EventInferenceCompleted,
+			OccuredAt: time.Now().UTC(),
+			Payload: events.InferenceCompletedPayload{
+				ConversationID:   conversationID,
+				UserMessageID:    userMessage.ID,
+				Provider:         h.provider.Name(),
+				Model:            req.Model,
+				LatencyMs:        latencyMs,
+				InputPreview:     preview(req.Content, 200),
+				OutputPreview:    preview(responseText, 200),
+				AssistantContent: responseText,
+				PromptTokens:     0,
+				CompletionTokens: 0,
+				TotalTokens:      0,
+				RawMetadata:      map[string]any{"streaming": true},
+				RequestedAt:      requestedAt,
+				RespondedAt:      respondedAt,
+			},
+		})
+
+		donePayload, _ := json.Marshal(map[string]any{
+			"event":             "done",
+			"assistant_message": assistantMessage,
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", donePayload)
+		if canFlush {
+			flusher.Flush()
+		}
+		return
+	}
+
 	upstream, err := h.provider.Complete(r.Context(), req.Model, prompt, false)
 	respondedAt := time.Now().UTC()
 	latencyMs := int(respondedAt.Sub(requestedAt).Milliseconds())
 	if err != nil {
-		logEntry, _ := h.inferenceLogs.Create(r.Context(), &models.InferenceLog{
-			ConversationID: conversationID,
-			MessageID:      userMessage.ID,
-			Provider:       h.provider.Name(),
-			Model:          req.Model,
-			Status:         "error",
-			LatencyMs:      latencyMs,
-			InputPreview:   preview(req.Content, 200),
-			ErrorMessage:   err.Error(),
-			RawMetadata:    map[string]any{"error": err.Error()},
-			RequestedAt:    requestedAt,
-			RespondedAt:    &respondedAt,
+		h.bus.Publish(events.Event{
+			Type:      events.EventInferenceFailed,
+			OccuredAt: time.Now().UTC(),
+			Payload: events.InferenceFailedPayload{
+				ConversationID: conversationID,
+				UserMessageID:  userMessage.ID,
+				Provider:       h.provider.Name(),
+				Model:          req.Model,
+				LatencyMs:      latencyMs,
+				InputPreview:   preview(req.Content, 200),
+				ErrorMessage:   err.Error(),
+				RawMetadata:    map[string]any{"error": err.Error()},
+				RequestedAt:    requestedAt,
+				RespondedAt:    respondedAt,
+			},
 		})
-		writeJSON(w, http.StatusBadGateway, inferenceResponse{UserMessage: userMessage, InferenceLog: logEntry})
+		fmt.Println("-------", err)
+		writeJSON(w, http.StatusBadGateway, inferenceResponse{UserMessage: userMessage})
 		return
 	}
 	defer upstream.Body.Close()
@@ -213,20 +387,24 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 		completion = &providers.Completion{}
 	}
 	if err != nil {
-		logEntry, _ := h.inferenceLogs.Create(r.Context(), &models.InferenceLog{
-			ConversationID: conversationID,
-			MessageID:      userMessage.ID,
-			Provider:       h.provider.Name(),
-			Model:          req.Model,
-			Status:         "error",
-			LatencyMs:      latencyMs,
-			InputPreview:   preview(req.Content, 200),
-			ErrorMessage:   err.Error(),
-			RawMetadata:    completion.RawMetadata,
-			RequestedAt:    requestedAt,
-			RespondedAt:    &respondedAt,
+		h.bus.Publish(events.Event{
+			Type:      events.EventInferenceFailed,
+			OccuredAt: time.Now().UTC(),
+			Payload: events.InferenceFailedPayload{
+				ConversationID: conversationID,
+				UserMessageID:  userMessage.ID,
+				Provider:       h.provider.Name(),
+				Model:          req.Model,
+				LatencyMs:      latencyMs,
+				InputPreview:   preview(req.Content, 200),
+				ErrorMessage:   err.Error(),
+				RawMetadata:    map[string]any{"error": err.Error()},
+				RequestedAt:    requestedAt,
+				RespondedAt:    respondedAt,
+			},
 		})
-		writeJSON(w, http.StatusBadGateway, inferenceResponse{UserMessage: userMessage, InferenceLog: logEntry})
+		fmt.Println("-------", err)
+		writeJSON(w, http.StatusBadGateway, inferenceResponse{UserMessage: userMessage})
 		return
 	}
 
@@ -236,31 +414,30 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	logEntry, err := h.inferenceLogs.Create(r.Context(), &models.InferenceLog{
-		ConversationID:   conversationID,
-		MessageID:        assistantMessage.ID,
-		Provider:         h.provider.Name(),
-		Model:            req.Model,
-		Status:           "success",
-		LatencyMs:        latencyMs,
-		PromptTokens:     completion.Usage.InputTokens,
-		CompletionTokens: completion.Usage.OutputTokens,
-		TotalTokens:      completion.Usage.InputTokens + completion.Usage.OutputTokens,
-		InputPreview:     preview(req.Content, 200),
-		OutputPreview:    preview(completion.Text, 200),
-		RawMetadata:      completion.RawMetadata,
-		RequestedAt:      requestedAt,
-		RespondedAt:      &respondedAt,
+	h.bus.Publish(events.Event{
+		Type:      events.EventInferenceCompleted,
+		OccuredAt: time.Now().UTC(),
+		Payload: events.InferenceCompletedPayload{
+			ConversationID:   conversationID,
+			UserMessageID:    userMessage.ID,
+			Provider:         h.provider.Name(),
+			Model:            req.Model,
+			LatencyMs:        latencyMs,
+			InputPreview:     preview(req.Content, 200),
+			OutputPreview:    preview(completion.Text, 200),
+			AssistantContent: completion.Text,
+			PromptTokens:     completion.Usage.InputTokens,
+			CompletionTokens: completion.Usage.OutputTokens,
+			TotalTokens:      completion.Usage.InputTokens + completion.Usage.OutputTokens,
+			RawMetadata:      completion.RawMetadata,
+			RequestedAt:      requestedAt,
+			RespondedAt:      respondedAt,
+		},
 	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to store inference log")
-		return
-	}
 
 	writeJSON(w, http.StatusOK, inferenceResponse{
 		UserMessage:      userMessage,
 		AssistantMessage: assistantMessage,
-		InferenceLog:     logEntry,
 	})
 }
 

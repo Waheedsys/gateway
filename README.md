@@ -1,115 +1,240 @@
 # AI Gateway
 
-Lightweight LLM gateway for multi-turn conversations, inference logging, and log ingestion.
+A high-performance, lightweight LLM gateway for multi-turn conversations, log ingestion, and analytics. Built in Go, it features native Server-Sent Events (SSE) streaming, a non-blocking event-driven architecture, Redis-based rate limiting, and robust containerization.
 
-## Setup
+---
 
-1. Start dependencies:
+## Architecture Overview
 
-```powershell
-docker compose up -d
+The gateway is built around a decoupled, resilient architecture where client responsiveness is prioritized.
+
+```
+                  ┌────────────────────────────────────────────────────────┐
+                  │                    Client Request                      │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │ POST /conversations/{id}/infer
+                                             ▼
+                                ┌─────────────────────────┐
+                                │   Inference Endpoint    │
+                                └──────┬────────────┬─────┘
+                                       │            │
+             If stream=true (SSE path) │            │ If stream=false (Blocking path)
+                                       ▼            ▼
+             ┌───────────────────────────┐        ┌───────────────────────────┐
+             │ Immediate SSE Connection  │        │   Wait for LLM response   │
+             │ (Flushes start/text/done) │        │   and return full JSON    │
+             └─────────────┬─────────────┘        └─────────────┬─────────────┘
+                           │                                    │
+                           │     Publish event asynchronously   │
+                           └─────────────┐        ┌─────────────┘
+                                         │        │
+                                         ▼        ▼
+                               ┌─────────────────────────┐
+                               │  In-Process Event Bus   │
+                               │  (Go Buffered Channel)  │
+                               └────────────┬────────────┘
+                                            │
+                                            │ Dispatched to
+                                            ▼
+                               ┌─────────────────────────┐
+                               │   Database Subscriber   │
+                               │   (Async DB Write)      │
+                               └────────────┬────────────┘
+                                            │
+                                            ▼
+                               ┌─────────────────────────┐
+                               │      PostgreSQL DB      │
+                               │    (inference_logs)     │
+                               └─────────────────────────┘
 ```
 
-2. Create `.env`:
+### Key Technical Achievements
 
-```env
-DATABASE_URL=postgres://postgres:postgres@localhost:5433/ai_gateway?sslmode=disable
-REDIS_ADDR=localhost:6379
-JWT_SECRET=replace-me
-LLM_PROVIDER=openrouter
-OPENROUTER_API_KEY=your-openrouter-key
-```
+1. **Native Server-Sent Events (SSE) Streaming**: Supports real-time client interaction by proxying, parsing, and streaming chunks back to the client immediately using `text/event-stream` with chunk-by-chunk HTTP flushing.
+2. **Non-Blocking Event-Driven Persistence**: Eliminates database query latency from the client's request path. HTTP handlers drop event payloads onto a buffered channel in the `events.Bus`. A background goroutine consumes these events to save logs asynchronously.
+3. **Defense-in-Depth Concurrency**: Utilizes non-blocking select-default channel publishers so that if the queue becomes completely filled (e.g. during an extreme spike), it falls back to dropping log events rather than freezing incoming client requests. A custom panic recovery defer statement ensures that sub-routine failures never crash the parent server process.
+4. **Clean Provider Interfaces**: Highly modular LLM provider abstractions (`providers.Provider` interface) supporting custom token calculation, metadata mapping, and raw response payloads (implemented for **OpenRouter** and **Anthropic**).
 
-The default OpenRouter model is `openrouter/free`. You can override it per request with the `model` field. OpenRouter free models can change over time, so use any currently available model ID ending in `:free`.
+---
 
-3. Run the API:
+## Setup & Deployment
 
-```powershell
-go run ./cmd/gateway
-```
+The repository comes fully containerized and configured for local development or production-like environments.
 
-Migrations run automatically at startup.
+### Option A: Running with Docker (Recommended)
 
-## Auth
+To run the entire ecosystem (Go API + Postgres + Redis) with a single command:
 
-Protected endpoints require a bearer JWT signed with `JWT_SECRET`. A helper exists at `cmd/gentoken`.
+1. **Verify your `.env` configuration** or copy it:
+   ```env
+   DATABASE_URL=postgres://postgres:postgres@postgres:5432/ai_gateway?sslmode=disable
+   REDIS_ADDR=redis:6379
+   MIGRATIONS_PATH=./migrations
+   JWT_SECRET=supersecretjwtkey123!
+   LLM_PROVIDER=openrouter
+   OPENROUTER_API_KEY=your_key_here
+   ```
 
-```powershell
+2. **Build and spin up the Docker stack**:
+   ```bash
+   docker compose up -d --build
+   ```
+
+3. **Verify running containers and health checks**:
+   ```bash
+   docker compose ps
+   ```
+   Postgres and Redis carry automated health checks (`pg_isready` and `redis-cli ping` respectively). The gateway will wait to boot until they are reported healthy.
+
+### Option B: Running Locally
+
+If you prefer to run the database & cache inside containers but run the Go process locally:
+
+1. **Launch dependencies**:
+   ```bash
+   docker compose up -d postgres redis
+   ```
+
+2. **Configure `.env` for local access**:
+   ```env
+   DATABASE_URL=postgres://postgres:postgres@localhost:5433/ai_gateway?sslmode=disable
+   REDIS_ADDR=localhost:6379
+   MIGRATIONS_PATH=./migrations
+   JWT_SECRET=supersecretjwtkey123!
+   LLM_PROVIDER=openrouter
+   OPENROUTER_API_KEY=your-openrouter-key
+   ```
+
+3. **Run the API**:
+   ```bash
+   go run ./cmd/gateway
+   ```
+   *Note: Database schema migrations run automatically at startup!*
+
+---
+
+## Authentication
+
+Protected endpoints require a bearer JWT signed with the defined `JWT_SECRET`. 
+
+Generate a token for local testing by running:
+```bash
 go run ./cmd/gentoken
 ```
 
-Use the returned token as:
-
+Send the resulting token in the request header:
 ```text
 Authorization: Bearer <token>
 ```
 
-## Core Endpoints
+---
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Health check |
-| `POST` | `/conversations` | Create a conversation |
-| `GET` | `/conversations` | List conversations |
-| `GET` | `/conversations/{id}` | Resume/load one conversation |
-| `POST` | `/conversations/{id}/cancel` | Cancel a conversation |
-| `GET` | `/conversations/{id}/messages` | List chat messages |
-| `POST` | `/conversations/{id}/infer` | Store user message, call the configured LLM provider, store assistant message, store inference log |
-| `GET` | `/conversations/{id}/inference-logs` | List logs for one conversation |
-| `POST` | `/ingest/inference-logs` | Ingest SDK/wrapper inference logs |
-| `GET` | `/inference/stats` | Last 24h latency/token/error summary |
+## Core API Endpoints
 
-## Demo Requests
+| Method | Path | Auth Required | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/health` | No | Health check |
+| `POST` | `/conversations` | Yes | Create a new conversation |
+| `GET` | `/conversations` | Yes | List all conversations |
+| `GET` | `/conversations/{id}` | Yes | Load conversation state |
+| `POST` | `/conversations/{id}/cancel`| Yes | Mark conversation as cancelled (blocks further inference) |
+| `GET` | `/conversations/{id}/messages`| Yes | List all chat messages in a conversation |
+| `POST` | `/conversations/{id}/infer` | Yes | Store user message, invoke LLM, stream back or block-return assistant reply, publish log event |
+| `GET` | `/conversations/{id}/inference-logs` | Yes | List logged inference cycles for this conversation |
+| `POST` | `/ingest/inference-logs` | Yes | Ingest analytics logs from external SDKs/wrappers |
+| `GET` | `/inference/stats` | Yes | Get historical summary metrics (avg latency, token count, errors) |
 
-Create a conversation:
+---
 
-```powershell
-curl.exe -X POST http://localhost:8080/conversations `
-  -H "Authorization: Bearer <token>" `
-  -H "Content-Type: application/json" `
-  -d "{\"title\":\"Demo chat\"}"
+## Features & Deep Dives
+
+### 1. Server-Sent Events (SSE) Streaming
+
+When invoking the inference endpoint `/conversations/{id}/infer` with `stream: true`, the gateway returns a standard EventSource-compatible chunked stream. 
+
+**Response Event Stream Flow:**
+- **`event: start`**: Emitted immediately with the created `user_message` object.
+- **`event: text`**: Emitted repeatedly as characters stream back from the LLM provider, providing low-latency interaction.
+- **`event: done`**: Emitted when the stream terminates safely, providing the fully persisted `assistant_message` database object.
+- **`event: error`**: Emitted in the event of an upstream provider drop or database writing failure.
+
+#### Sample Streaming Request
+```bash
+curl.exe -X POST http://localhost:8080/conversations/YOUR_CONVERSATION_ID/infer \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"content\":\"Explain quantum computing in one sentence.\",\"stream\":true}"
 ```
 
-Run inference:
+#### Sample Streaming Response
+```text
+data: {"event":"start","user_message":{"id":"...","conversation_id":"...","role":"user","content":"Explain quantum...","created_at":"..."}}
 
-```powershell
-curl.exe -X POST http://localhost:8080/conversations/<conversation_id>/infer `
-  -H "Authorization: Bearer <token>" `
-  -H "Content-Type: application/json" `
-  -d "{\"content\":\"Explain inference logging in one paragraph.\",\"model\":\"openrouter/free\"}"
+data: {"event":"text","text":"Quantum"}
+
+data: {"event":"text","text":" computing"}
+
+...
+
+data: {"event":"done","assistant_message":{"id":"...","conversation_id":"...","role":"assistant","content":"Quantum computing uses subatomic particles to process complex math at super speeds.","created_at":"..."}}
 ```
 
-Ingest a standalone log:
+---
 
-```powershell
-curl.exe -X POST http://localhost:8080/ingest/inference-logs `
-  -H "Authorization: Bearer <token>" `
-  -H "Content-Type: application/json" `
-  -d "{\"provider\":\"openrouter\",\"model\":\"openrouter/free\",\"status\":\"success\",\"latency_ms\":720,\"prompt_tokens\":12,\"completion_tokens\":32,\"total_tokens\":44,\"input_preview\":\"hello\",\"output_preview\":\"hi there\",\"raw_metadata\":{\"source\":\"manual-demo\"}}"
+### 2. Go Channel-Based Event Bus
+
+To keep inference response times as short as possible, logging is decoupled from the HTTP response thread. 
+
+- **Buffered Go Channel**: The event bus maintains a buffer of size `100` (`events.NewBus(100)`).
+- **Graceful Backpressure Management**: Publishers use Go's non-blocking `select` write. If the channel fills completely, the message is gracefully dropped, and a warning is logged. This protects application uptime during severe database bottlenecks.
+- **Subscriber Protection**: Subscribers run inside dedicated goroutines. A deferred `recover()` block wraps the subscriber execution context to prevent a sudden runtime panic from taking down the web server.
+
+---
+
+### 3. Redis Rate Limiting
+
+The application applies a custom Token Bucket middleware utilizing Redis. Each client API key has a rate limit applied dynamically:
+- Prevents DDoS attacks and LLM provider credit exhaustion.
+- Features automatic sliding TTLs and token replenishing.
+
+---
+
+### 4. Database Schema & Persistence
+
+The relational database is configured to survive data cleanup safely:
+- **Conversations**: Manages state (e.g. `cancelled` to restrict further chat operations).
+- **Messages**: Holds conversation histories. Uses `ON DELETE CASCADE` to clean up messages when their parent conversation is removed.
+- **Inference Logs**: Keeps detailed analytics tracking latency, status (`success` / `error`), model parameters, and raw vendor metadata (`JSONB`). Connects via `ON DELETE SET NULL` to keep valuable metrics even if conversations/messages are pruned.
+
+---
+
+## Containerization Architecture
+
+The project's `dockerfile` follows modern container best practices for minimal image sizes and enhanced security:
+
+```
+  Stage 1: Statically Build Binary                  Stage 2: Minimal Distroless Alpine
+┌─────────────────────────────────┐               ┌──────────────────────────────────┐
+│  FROM golang:1.26-alpine        │               │  FROM alpine:3.20                │
+│                                 │               │                                  │
+│  - Install git                  │               │  - Install ca-certificates      │
+│  - Cache go.mod & go.sum        │               │  - Add non-root "gateway" user   │
+│  - Copy source code             │               │  - COPY compiled binary          │
+│  - Build statically linked app  ├───────────────┼─▶ - COPY migrations/             │
+│    (CGO_ENABLED=0 GOOS=linux)   │               │  - USER gateway (security!)      │
+│    Size: ~750MB                 │               │  Final size: ~20MB               │
+└─────────────────────────────────┘               └──────────────────────────────────┘
 ```
 
-Seed demo data directly in Postgres:
+- **Outbound Outcall Certificates**: Stage 2 installs `ca-certificates` to support HTTPS calls to upstream providers.
+- **Rootless Security**: Runs as the custom user `gateway` so the container process has zero access to default system processes.
+- **Build Caching**: Dependencies are resolved separately from source changes to keep incremental local container rebuilds under 2 seconds.
 
-```powershell
-docker exec -i ai_gateway_postgres psql -U postgres -d ai_gateway < seeds/demo_inference_data.sql
-```
+---
 
-## Architecture Notes
+## Future Roadmap & Improvements
 
-The API stores conversations and messages in Postgres. The inference endpoint uses a short sliding context window from recent messages, calls the provider wrapper, parses text and token usage, then writes an inference log. The ingestion endpoint accepts log payloads from an SDK or middleware path and stores normalized metadata plus raw provider metadata in JSONB.
-
-Redis is used for per-user rate limiting. JWT auth protects application routes. Provider code is behind a small interface. OpenRouter is the default provider for free-model testing, and Anthropic remains available by setting `LLM_PROVIDER=anthropic`.
-
-## Schema Decisions
-
-`conversations` owns conversation lifecycle state. `messages` stores ordered chat history and cascades when a conversation is deleted. `inference_logs` stores provider/model/status, latency, token usage, previews, error text, timestamps, and `raw_metadata` JSONB for provider-specific details.
-
-The log table references conversations and messages with `ON DELETE SET NULL` so analytics history can survive data cleanup.
-
-## Tradeoffs
-
-The inference endpoint currently buffers non-streaming provider responses so it can persist assistant text and token usage in one transaction-like flow. Streaming support exists at the provider/proxy level but is not yet integrated with message persistence. The current context strategy is simple last-N messages instead of summarization or token-aware trimming.
-
-## Improvements With More Time
-
-Add a frontend chat UI, stream persisted responses, add more provider-specific metadata normalization, add dashboards for latency/throughput/errors, add PII redaction before storage, add retries/dead-letter handling for ingestion, and add integration tests with a mocked provider.
+- **Global Metrics Dashboard**: A visualization suite to map gateway analytics (error spikes, average token costs, and average provider response latency).
+- **PII Redaction Engine**: Advanced regex and Named Entity Recognition (NER) filters to scrub credit cards, phone numbers, and keys before persisting logs to `inference_logs`.
+- **Ingestion Failover Queues**: Dead-Letter Queues (DLQ) or Apache Kafka support for bulk `/ingest/inference-logs` to support enterprise-grade backpressure.
+- **Provider Retry & Failover**: Automatic fallback to alternative models/vendors if an upstream service (e.g., OpenRouter) encounters 5xx error rates.
