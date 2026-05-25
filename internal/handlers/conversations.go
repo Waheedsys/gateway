@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/Waheedsys/ai-gateway/internal/providers"
 	"github.com/Waheedsys/ai-gateway/internal/repository"
 	"github.com/go-chi/chi/v5"
+	"github.com/redis/go-redis/v9"
 )
 
 type ConversationHandler struct {
@@ -21,15 +25,17 @@ type ConversationHandler struct {
 	inferenceLogs *repository.InferenceLog
 	provider      providers.Provider
 	bus           *events.Bus
+	rdb           *redis.Client
 }
 
-func NewConversationHandler(conversations *repository.Conversation, messages *repository.MessageRepo, inferenceLogs *repository.InferenceLog, provider providers.Provider, bus *events.Bus) *ConversationHandler {
+func NewConversationHandler(conversations *repository.Conversation, messages *repository.MessageRepo, inferenceLogs *repository.InferenceLog, provider providers.Provider, bus *events.Bus, rdb *redis.Client) *ConversationHandler {
 	return &ConversationHandler{
 		conversations: conversations,
 		messages:      messages,
 		inferenceLogs: inferenceLogs,
 		provider:      provider,
 		bus:           bus,
+		rdb:           rdb,
 	}
 }
 
@@ -177,7 +183,7 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 		req.Model = h.provider.DefaultModel()
 	}
 
-	stream := true
+	stream := false
 	if req.Stream != nil {
 		stream = *req.Stream
 	}
@@ -196,6 +202,144 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 
 	prompt := buildContextPrompt(history)
 	requestedAt := time.Now().UTC()
+
+	// Compute cache key
+	hasher := sha256.New()
+	hasher.Write([]byte(req.Model + ":" + req.Content))
+	cacheKey := "cache:inference:" + hex.EncodeToString(hasher.Sum(nil))
+
+	var cachedResponse string
+	var cacheHit bool
+	if h.rdb != nil {
+		val, err := h.rdb.Get(r.Context(), cacheKey).Result()
+		if err == nil {
+			cachedResponse = val
+			cacheHit = true
+		}
+	}
+
+	if cacheHit {
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(http.StatusOK)
+
+			flusher, canFlush := w.(http.Flusher)
+
+			// Send initial user message event
+			startPayload, _ := json.Marshal(map[string]any{
+				"event":        "start",
+				"user_message": userMessage,
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", startPayload)
+			if canFlush {
+				flusher.Flush()
+			}
+
+			// Simulate streaming the cached response in word chunks
+			words := strings.Split(cachedResponse, " ")
+			for i, word := range words {
+				chunkText := word
+				if i < len(words)-1 {
+					chunkText += " "
+				}
+				textPayload, _ := json.Marshal(map[string]any{
+					"event": "text",
+					"text":  chunkText,
+				})
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", textPayload)
+				if canFlush {
+					flusher.Flush()
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+
+			respondedAt := time.Now().UTC()
+			latencyMs := int(respondedAt.Sub(requestedAt).Milliseconds())
+
+			assistantMessage, err := h.messages.Create(r.Context(), conversationID, models.RoleAssistant, cachedResponse)
+			if err != nil {
+				errorPayload, _ := json.Marshal(map[string]any{
+					"event": "error",
+					"error": "failed to store assistant message",
+				})
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", errorPayload)
+				if canFlush {
+					flusher.Flush()
+				}
+				return
+			}
+
+			h.bus.Publish(events.Event{
+				Type:      events.EventInferenceCompleted,
+				OccuredAt: time.Now().UTC(),
+				Payload: events.InferenceCompletedPayload{
+					ConversationID:   conversationID,
+					UserMessageID:    userMessage.ID,
+					Provider:         h.provider.Name(),
+					Model:            req.Model,
+					LatencyMs:        latencyMs,
+					InputPreview:     preview(req.Content, 200),
+					OutputPreview:    preview(cachedResponse, 200),
+					AssistantContent: cachedResponse,
+					PromptTokens:     0,
+					CompletionTokens: 0,
+					TotalTokens:      0,
+					RawMetadata:      map[string]any{"streaming": true, "cached": true},
+					RequestedAt:      requestedAt,
+					RespondedAt:      respondedAt,
+				},
+			})
+
+			donePayload, _ := json.Marshal(map[string]any{
+				"event":             "done",
+				"assistant_message": assistantMessage,
+			})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", donePayload)
+			if canFlush {
+				flusher.Flush()
+			}
+			return
+		} else {
+			respondedAt := time.Now().UTC()
+			latencyMs := int(respondedAt.Sub(requestedAt).Milliseconds())
+
+			assistantMessage, err := h.messages.Create(r.Context(), conversationID, models.RoleAssistant, cachedResponse)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to store assistant message")
+				return
+			}
+
+			h.bus.Publish(events.Event{
+				Type:      events.EventInferenceCompleted,
+				OccuredAt: time.Now().UTC(),
+				Payload: events.InferenceCompletedPayload{
+					ConversationID:   conversationID,
+					UserMessageID:    userMessage.ID,
+					Provider:         h.provider.Name(),
+					Model:            req.Model,
+					LatencyMs:        latencyMs,
+					InputPreview:     preview(req.Content, 200),
+					OutputPreview:    preview(cachedResponse, 200),
+					AssistantContent: cachedResponse,
+					PromptTokens:     0,
+					CompletionTokens: 0,
+					TotalTokens:      0,
+					RawMetadata:      map[string]any{"streaming": false, "cached": true},
+					RequestedAt:      requestedAt,
+					RespondedAt:      respondedAt,
+				},
+			})
+
+			writeJSON(w, http.StatusOK, inferenceResponse{
+				UserMessage:      userMessage,
+				AssistantMessage: assistantMessage,
+			})
+			return
+		}
+	}
 
 	if stream {
 		upstream, err := h.provider.Complete(r.Context(), req.Model, prompt, true)
@@ -324,6 +468,17 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 			return
 		}
 
+		// Cache response in Redis
+		if h.rdb != nil {
+			ttl := 5 * time.Minute
+			if envTTL := os.Getenv("CACHE_TTL"); envTTL != "" {
+				if parsed, err := time.ParseDuration(envTTL); err == nil {
+					ttl = parsed
+				}
+			}
+			_ = h.rdb.Set(r.Context(), cacheKey, responseText, ttl).Err()
+		}
+
 		h.bus.Publish(events.Event{
 			Type:      events.EventInferenceCompleted,
 			OccuredAt: time.Now().UTC(),
@@ -412,6 +567,17 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store assistant message")
 		return
+	}
+
+	// Cache response in Redis
+	if h.rdb != nil {
+		ttl := 5 * time.Minute
+		if envTTL := os.Getenv("CACHE_TTL"); envTTL != "" {
+			if parsed, err := time.ParseDuration(envTTL); err == nil {
+				ttl = parsed
+			}
+		}
+		_ = h.rdb.Set(r.Context(), cacheKey, completion.Text, ttl).Err()
 	}
 
 	h.bus.Publish(events.Event{

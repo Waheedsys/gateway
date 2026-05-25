@@ -52,7 +52,7 @@ func main() {
 	bus := events.NewBus(100)
 	defer bus.Close()
 
-	conversationHandler := handlers.NewConversationHandler(conversationRepo, messageRepo, inferenceLogRepo, provider, bus)
+	conversationHandler := handlers.NewConversationHandler(conversationRepo, messageRepo, inferenceLogRepo, provider, bus, rdb)
 	ingestionHandler := handlers.NewIngestionHandler(inferenceLogRepo)
 
 	bus.Subscribe(func(e events.Event) {
