@@ -1,17 +1,17 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: ai_gateway_postgres
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    container_name: ai_gateway_elasticsearch
     environment:
-      POSTGRES_DB: ai_gateway
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports:
-      - "5433:5432"
+      - "9200:9200"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - elasticsearch_data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_gateway"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -27,6 +27,18 @@ services:
       timeout: 5s
       retries: 10
 
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.0.0
+    container_name: ai_gateway_kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      XPACK_SECURITY_ENABLED: "false"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
   gateway:
     build:
       context: .
@@ -35,19 +47,19 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/ai_gateway?sslmode=disable
+      ELASTICSEARCH_URL: http://elasticsearch:9200
       REDIS_ADDR: redis:6379
-      MIGRATIONS_PATH: ./migrations
       JWT_SECRET: ${JWT_SECRET:-supersecretjwtkey123!}
       LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      MCP_SERVER_COMMAND: ${MCP_SERVER_COMMAND:-}
     depends_on:
-      postgres:
+      elasticsearch:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: on-failure
 
 volumes:
-  postgres_data:
+  elasticsearch_data:

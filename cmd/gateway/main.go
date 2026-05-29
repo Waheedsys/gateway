@@ -9,14 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Waheedsys/ai-gateway/internal/auth"
-	"github.com/Waheedsys/ai-gateway/internal/db"
 	"github.com/Waheedsys/ai-gateway/internal/events"
 	"github.com/Waheedsys/ai-gateway/internal/handlers"
+	"github.com/Waheedsys/ai-gateway/internal/mcpclient"
 	"github.com/Waheedsys/ai-gateway/internal/models"
 	"github.com/Waheedsys/ai-gateway/internal/providers"
-	"github.com/Waheedsys/ai-gateway/internal/ratelimiter"
 	"github.com/Waheedsys/ai-gateway/internal/repository"
+	"github.com/Waheedsys/ai-gateway/internal/search"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
@@ -33,26 +32,25 @@ func main() {
 	})
 	defer rdb.Close()
 
-	// Postgres
-	pool, err := db.Connect()
+	es, err := search.Connect()
 	if err != nil {
-		log.Fatalf("failed to connect to postgres: %v", err)
+		log.Fatalf("failed to connect to elasticsearch: %v", err)
 	}
-	defer pool.Close()
-	if err := db.ApplyMigrations(context.Background(), pool); err != nil {
-		log.Fatalf("failed to apply database migrations: %v", err)
+	if err := es.EnsureIndexes(context.Background()); err != nil {
+		log.Fatalf("failed to create elasticsearch indexes: %v", err)
 	}
 
-	conversationRepo := repository.NewConversationRepo(pool)
-	messageRepo := repository.NewMessageRepo(pool)
-	inferenceLogRepo := repository.NewInferenceLogRepo(pool)
+	conversationRepo := repository.NewConversationRepo(es)
+	messageRepo := repository.NewMessageRepo(es)
+	inferenceLogRepo := repository.NewInferenceLogRepo(es)
 	provider := newProviderFromEnv()
+	mcpClient := mcpclient.NewFromEnv()
 
 	// 1. Initialize the Event Bus ( buffered channel, background consumer)
 	bus := events.NewBus(100)
 	defer bus.Close()
 
-	conversationHandler := handlers.NewConversationHandler(conversationRepo, messageRepo, inferenceLogRepo, provider, bus, rdb)
+	conversationHandler := handlers.NewConversationHandler(conversationRepo, messageRepo, inferenceLogRepo, provider, bus, rdb, mcpClient)
 	ingestionHandler := handlers.NewIngestionHandler(inferenceLogRepo)
 
 	bus.Subscribe(func(e events.Event) {
@@ -120,8 +118,6 @@ func main() {
 	})
 
 	r.Group(func(r chi.Router) {
-		r.Use(auth.Middleware)
-		r.Use(ratelimiter.Middleware(rdb))
 		conversationHandler.Routes(r)
 		ingestionHandler.Routes(r)
 	})

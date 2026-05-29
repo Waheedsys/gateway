@@ -2,110 +2,103 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/Waheedsys/ai-gateway/internal/models"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/Waheedsys/ai-gateway/internal/search"
 )
 
+const inferenceLogsIndex = "inference_logs"
+
 type InferenceLog struct {
-	db *pgxpool.Pool
+	es *search.Client
 }
 
-func NewInferenceLogRepo(db *pgxpool.Pool) *InferenceLog {
-	return &InferenceLog{db: db}
+func NewInferenceLogRepo(es *search.Client) *InferenceLog {
+	return &InferenceLog{es: es}
 }
 
-// INSERT — called by ingestion endpoint
 func (r *InferenceLog) Create(ctx context.Context, log *models.InferenceLog) (*models.InferenceLog, error) {
-	meta, _ := json.Marshal(log.RawMetadata)
-	var createdID string
-	var createdRequestedAt time.Time
-	err := r.db.QueryRow(ctx, `
-        INSERT INTO inference_logs (
-            conversation_id, message_id, provider, model, status,
-            latency_ms, prompt_tokens, completion_tokens, total_tokens,
-            input_preview, output_preview, error_message,
-            raw_metadata, requested_at, responded_at
-        ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
-        )
-        RETURNING id, requested_at
-    `,
-		nullableString(log.ConversationID), nullableString(log.MessageID), log.Provider, log.Model, log.Status,
-		log.LatencyMs, log.PromptTokens, log.CompletionTokens, log.TotalTokens,
-		log.InputPreview, log.OutputPreview, log.ErrorMessage,
-		meta, log.RequestedAt, log.RespondedAt,
-	).Scan(&createdID, &createdRequestedAt)
-	if err != nil {
-		return nil, err
-	}
-
 	created := *log
-	created.ID = createdID
-	created.RequestedAt = createdRequestedAt
-	return &created, nil
+	if created.ID == "" {
+		created.ID = newID()
+	}
+	if created.RequestedAt.IsZero() {
+		created.RequestedAt = time.Now().UTC()
+	}
+	if created.RawMetadata == nil {
+		created.RawMetadata = map[string]any{}
+	}
+	return &created, r.es.Index(ctx, inferenceLogsIndex, created.ID, &created)
 }
 
-// LIST logs for a conversation
 func (r *InferenceLog) ListByConversation(ctx context.Context, convID string) ([]models.InferenceLog, error) {
-	rows, err := r.db.Query(ctx, `
-        SELECT id, conversation_id, message_id, provider, model, status,
-               latency_ms, prompt_tokens, completion_tokens, total_tokens,
-               input_preview, output_preview, error_message, requested_at, responded_at
-        FROM inference_logs
-        WHERE conversation_id = $1
-        ORDER BY requested_at DESC
-    `, convID)
+	var res inferenceLogSearchResponse
+	err := r.es.Search(ctx, inferenceLogsIndex, map[string]any{
+		"size": 500,
+		"sort": []any{map[string]any{"requested_at": map[string]any{"order": "desc"}}},
+		"query": map[string]any{
+			"term": map[string]any{"conversation_id": convID},
+		},
+	}, &res)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var logs []models.InferenceLog
-	for rows.Next() {
-		var l models.InferenceLog
-		rows.Scan(&l.ID, &l.ConversationID, &l.MessageID, &l.Provider, &l.Model,
-			&l.Status, &l.LatencyMs, &l.PromptTokens, &l.CompletionTokens,
-			&l.TotalTokens, &l.InputPreview, &l.OutputPreview, &l.ErrorMessage,
-			&l.RequestedAt, &l.RespondedAt)
-		logs = append(logs, l)
+	logs := make([]models.InferenceLog, 0, len(res.Hits.Hits))
+	for _, hit := range res.Hits.Hits {
+		logs = append(logs, hit.Source)
 	}
-	return logs, rows.Err()
+	return logs, nil
 }
 
-// DASHBOARD stats — latency, tokens, error rate
 func (r *InferenceLog) GetStats(ctx context.Context) (map[string]any, error) {
-	var stats map[string]any
-	row := r.db.QueryRow(ctx, `
-        SELECT
-            COUNT(*)                                        AS total_requests,
-            COUNT(*) FILTER (WHERE status = 'error')       AS error_count,
-            COALESCE(AVG(latency_ms), 0)                    AS avg_latency_ms,
-            COALESCE(SUM(total_tokens), 0)                  AS total_tokens,
-            COALESCE(AVG(total_tokens), 0)                  AS avg_tokens_per_req
-        FROM inference_logs
-        WHERE requested_at > NOW() - INTERVAL '24 hours'
-    `)
-	var total, errors int
-	var avgLatency, totalTokens, avgTokens float64
-	if err := row.Scan(&total, &errors, &avgLatency, &totalTokens, &avgTokens); err != nil {
+	var res inferenceLogSearchResponse
+	err := r.es.Search(ctx, inferenceLogsIndex, map[string]any{
+		"size": 10000,
+		"query": map[string]any{
+			"range": map[string]any{
+				"requested_at": map[string]any{
+					"gte": time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339),
+				},
+			},
+		},
+	}, &res)
+	if err != nil {
 		return nil, err
 	}
-	stats = map[string]any{
+
+	var errors, totalLatency, totalTokens int
+	for _, hit := range res.Hits.Hits {
+		log := hit.Source
+		if log.Status == "error" {
+			errors++
+		}
+		totalLatency += log.LatencyMs
+		totalTokens += log.TotalTokens
+	}
+
+	total := len(res.Hits.Hits)
+	avgLatency := 0.0
+	avgTokens := 0.0
+	if total > 0 {
+		avgLatency = float64(totalLatency) / float64(total)
+		avgTokens = float64(totalTokens) / float64(total)
+	}
+
+	return map[string]any{
 		"total_requests": total,
 		"error_count":    errors,
 		"avg_latency_ms": avgLatency,
 		"total_tokens":   totalTokens,
 		"avg_tokens":     avgTokens,
-	}
-	return stats, nil
+	}, nil
 }
 
-func nullableString(value string) any {
-	if value == "" {
-		return nil
-	}
-	return value
+type inferenceLogSearchResponse struct {
+	Hits struct {
+		Hits []struct {
+			Source models.InferenceLog `json:"_source"`
+		} `json:"hits"`
+	} `json:"hits"`
 }

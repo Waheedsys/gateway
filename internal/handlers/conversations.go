@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Waheedsys/ai-gateway/internal/events"
+	"github.com/Waheedsys/ai-gateway/internal/mcpclient"
 	"github.com/Waheedsys/ai-gateway/internal/models"
 	"github.com/Waheedsys/ai-gateway/internal/providers"
 	"github.com/Waheedsys/ai-gateway/internal/repository"
@@ -26,9 +27,10 @@ type ConversationHandler struct {
 	provider      providers.Provider
 	bus           *events.Bus
 	rdb           *redis.Client
+	mcp           *mcpclient.Client
 }
 
-func NewConversationHandler(conversations *repository.Conversation, messages *repository.MessageRepo, inferenceLogs *repository.InferenceLog, provider providers.Provider, bus *events.Bus, rdb *redis.Client) *ConversationHandler {
+func NewConversationHandler(conversations *repository.Conversation, messages *repository.MessageRepo, inferenceLogs *repository.InferenceLog, provider providers.Provider, bus *events.Bus, rdb *redis.Client, mcp *mcpclient.Client) *ConversationHandler {
 	return &ConversationHandler{
 		conversations: conversations,
 		messages:      messages,
@@ -36,6 +38,7 @@ func NewConversationHandler(conversations *repository.Conversation, messages *re
 		provider:      provider,
 		bus:           bus,
 		rdb:           rdb,
+		mcp:           mcp,
 	}
 }
 
@@ -48,6 +51,8 @@ func (h *ConversationHandler) Routes(r chi.Router) {
 	r.Post("/conversations/{conversationID}/messages", h.CreateMessage)
 	r.Post("/conversations/{conversationID}/infer", h.RunInference)
 	r.Get("/conversations/{conversationID}/inference-logs", h.ListInferenceLogs)
+	r.Get("/mcp/tools", h.ListMCPTools)
+	r.Post("/mcp/tools/call", h.CallMCPTool)
 }
 
 type createConversationRequest struct {
@@ -68,6 +73,11 @@ type inferenceRequest struct {
 type inferenceResponse struct {
 	UserMessage      *models.Message `json:"user_message"`
 	AssistantMessage *models.Message `json:"assistant_message,omitempty"`
+}
+
+type callToolRequest struct {
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments"`
 }
 
 func (h *ConversationHandler) CreateConversation(w http.ResponseWriter, r *http.Request) {
@@ -200,7 +210,14 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	prompt := buildContextPrompt(history)
+	relevant, err := h.messages.SearchRelevant(r.Context(), conversationID, req.Content, 5)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to search conversation context")
+		return
+	}
+
+	toolContext, toolMetadata := h.tryMCPToolCall(r, req.Content)
+	prompt := buildContextPrompt(history, relevant, toolContext)
 	requestedAt := time.Now().UTC()
 
 	// Compute cache key
@@ -287,7 +304,7 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 					PromptTokens:     0,
 					CompletionTokens: 0,
 					TotalTokens:      0,
-					RawMetadata:      map[string]any{"streaming": true, "cached": true},
+					RawMetadata:      map[string]any{"streaming": true, "cached": true, "mcp": toolMetadata},
 					RequestedAt:      requestedAt,
 					RespondedAt:      respondedAt,
 				},
@@ -327,7 +344,7 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 					PromptTokens:     0,
 					CompletionTokens: 0,
 					TotalTokens:      0,
-					RawMetadata:      map[string]any{"streaming": false, "cached": true},
+					RawMetadata:      map[string]any{"streaming": false, "cached": true, "mcp": toolMetadata},
 					RequestedAt:      requestedAt,
 					RespondedAt:      respondedAt,
 				},
@@ -494,7 +511,7 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 				PromptTokens:     0,
 				CompletionTokens: 0,
 				TotalTokens:      0,
-				RawMetadata:      map[string]any{"streaming": true},
+				RawMetadata:      map[string]any{"streaming": true, "mcp": toolMetadata},
 				RequestedAt:      requestedAt,
 				RespondedAt:      respondedAt,
 			},
@@ -595,7 +612,7 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 			PromptTokens:     completion.Usage.InputTokens,
 			CompletionTokens: completion.Usage.OutputTokens,
 			TotalTokens:      completion.Usage.InputTokens + completion.Usage.OutputTokens,
-			RawMetadata:      completion.RawMetadata,
+			RawMetadata:      withMCPMetadata(completion.RawMetadata, toolMetadata),
 			RequestedAt:      requestedAt,
 			RespondedAt:      respondedAt,
 		},
@@ -619,9 +636,107 @@ func (h *ConversationHandler) ListInferenceLogs(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, logs)
 }
 
-func buildContextPrompt(messages []models.Message) string {
+func (h *ConversationHandler) ListMCPTools(w http.ResponseWriter, r *http.Request) {
+	if h.mcp == nil || !h.mcp.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "MCP_SERVER_COMMAND is not configured")
+		return
+	}
+	tools, err := h.mcp.ListTools(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": tools})
+}
+
+func (h *ConversationHandler) CallMCPTool(w http.ResponseWriter, r *http.Request) {
+	if h.mcp == nil || !h.mcp.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "MCP_SERVER_COMMAND is not configured")
+		return
+	}
+	var req callToolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "tool name is required")
+		return
+	}
+	if req.Arguments == nil {
+		req.Arguments = map[string]any{}
+	}
+	result, err := h.mcp.CallTool(r.Context(), req.Name, req.Arguments)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": req.Name, "result": result})
+}
+
+func (h *ConversationHandler) tryMCPToolCall(r *http.Request, content string) (string, map[string]any) {
+	metadata := map[string]any{"enabled": h.mcp != nil && h.mcp.Enabled(), "called": false}
+	if h.mcp == nil || !h.mcp.Enabled() {
+		return "", metadata
+	}
+
+	call, ok := parseInlineToolCall(content)
+	if !ok {
+		return "", metadata
+	}
+
+	result, err := h.mcp.CallTool(r.Context(), call.Name, call.Arguments)
+	metadata["called"] = true
+	metadata["tool"] = call.Name
+	if err != nil {
+		metadata["error"] = err.Error()
+		return "MCP tool " + call.Name + " failed: " + err.Error(), metadata
+	}
+	return "MCP tool " + call.Name + " result:\n" + result, metadata
+}
+
+func parseInlineToolCall(content string) (mcpclient.ToolCall, bool) {
+	trimmed := strings.TrimSpace(content)
+	for _, prefix := range []string{"tool:", "@tool:"} {
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		name, argsText, found := strings.Cut(rest, " ")
+		if !found {
+			return mcpclient.ToolCall{Name: strings.TrimSpace(name), Arguments: map[string]any{}}, name != ""
+		}
+		args := map[string]any{}
+		if strings.TrimSpace(argsText) != "" {
+			if err := json.Unmarshal([]byte(argsText), &args); err != nil {
+				args = map[string]any{"input": strings.TrimSpace(argsText)}
+			}
+		}
+		return mcpclient.ToolCall{Name: strings.TrimSpace(name), Arguments: args}, name != ""
+	}
+	return mcpclient.ToolCall{}, false
+}
+
+func buildContextPrompt(messages []models.Message, relevant []models.Message, toolContext string) string {
 	var b strings.Builder
 	b.WriteString("You are a helpful assistant. Continue this conversation using the recent context.\n\n")
+	if len(relevant) > 0 {
+		b.WriteString("Relevant retrieved context from Elasticsearch:\n")
+		for _, msg := range relevant {
+			b.WriteString("- ")
+			b.WriteString(string(msg.Role))
+			b.WriteString(": ")
+			b.WriteString(msg.Content)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(toolContext) != "" {
+		b.WriteString("Tool context:\n")
+		b.WriteString(toolContext)
+		b.WriteString("\n\n")
+	}
 	for _, msg := range messages {
 		b.WriteString(string(msg.Role))
 		b.WriteString(": ")
@@ -630,6 +745,14 @@ func buildContextPrompt(messages []models.Message) string {
 	}
 	b.WriteString("\nassistant:")
 	return b.String()
+}
+
+func withMCPMetadata(raw map[string]any, mcp map[string]any) map[string]any {
+	if raw == nil {
+		raw = map[string]any{}
+	}
+	raw["mcp"] = mcp
+	return raw
 }
 
 func preview(value string, max int) string {

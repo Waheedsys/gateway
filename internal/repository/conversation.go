@@ -1,85 +1,83 @@
 package repository
 
 import (
-    "context"
-    "time"
+	"context"
+	"time"
 
-    "github.com/jackc/pgx/v5/pgxpool"
-    "github.com/Waheedsys/ai-gateway/internal/models"
+	"github.com/Waheedsys/ai-gateway/internal/models"
+	"github.com/Waheedsys/ai-gateway/internal/search"
 )
 
+const conversationsIndex = "conversations"
+
 type Conversation struct {
-    db *pgxpool.Pool
+	es *search.Client
 }
 
-func NewConversationRepo(db *pgxpool.Pool) *Conversation {
-    return &Conversation{db: db}
+func NewConversationRepo(es *search.Client) *Conversation {
+	return &Conversation{es: es}
 }
 
-// CREATE
 func (r *Conversation) Create(ctx context.Context, title string) (*models.Conversation, error) {
-    var c models.Conversation
-    err := r.db.QueryRow(ctx, `
-        INSERT INTO conversations (title)
-        VALUES ($1)
-        RETURNING id, title, status, created_at, updated_at
-    `, title).Scan(&c.ID, &c.Title, &c.Status, &c.CreatedAt, &c.UpdatedAt)
-    return &c, err
+	now := time.Now().UTC()
+	c := &models.Conversation{
+		ID:        newID(),
+		Title:     title,
+		Status:    models.StatusActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	return c, r.es.Index(ctx, conversationsIndex, c.ID, c)
 }
 
-// GET by ID
 func (r *Conversation) GetByID(ctx context.Context, id string) (*models.Conversation, error) {
-    var c models.Conversation
-    err := r.db.QueryRow(ctx, `
-        SELECT id, title, status, created_at, updated_at
-        FROM conversations WHERE id = $1
-    `, id).Scan(&c.ID, &c.Title, &c.Status, &c.CreatedAt, &c.UpdatedAt)
-    return &c, err
+	var c models.Conversation
+	if err := r.es.Get(ctx, conversationsIndex, id, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
-// LIST all (for sidebar)
 func (r *Conversation) List(ctx context.Context) ([]models.Conversation, error) {
-    rows, err := r.db.Query(ctx, `
-        SELECT id, title, status, created_at, updated_at
-        FROM conversations
-        ORDER BY updated_at DESC
-    `)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
+	var res conversationSearchResponse
+	err := r.es.Search(ctx, conversationsIndex, map[string]any{
+		"size":  100,
+		"sort":  []any{map[string]any{"updated_at": map[string]any{"order": "desc"}}},
+		"query": map[string]any{"match_all": map[string]any{}},
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
 
-    var convs []models.Conversation
-    for rows.Next() {
-        var c models.Conversation
-        if err := rows.Scan(&c.ID, &c.Title, &c.Status, &c.CreatedAt, &c.UpdatedAt); err != nil {
-            return nil, err
-        }
-        convs = append(convs, c)
-    }
-    return convs, rows.Err()
+	convs := make([]models.Conversation, 0, len(res.Hits.Hits))
+	for _, hit := range res.Hits.Hits {
+		convs = append(convs, hit.Source)
+	}
+	return convs, nil
 }
 
-// CANCEL (soft status update — not hard delete)
 func (r *Conversation) Cancel(ctx context.Context, id string) error {
-    _, err := r.db.Exec(ctx, `
-        UPDATE conversations
-        SET status = 'cancelled', updated_at = $1
-        WHERE id = $2
-    `, time.Now(), id)
-    return err
+	return r.es.Update(ctx, conversationsIndex, id, map[string]any{
+		"status":     models.StatusCancelled,
+		"updated_at": time.Now().UTC(),
+	})
 }
 
-// UPDATE title
 func (r *Conversation) UpdateTitle(ctx context.Context, id, title string) error {
-    _, err := r.db.Exec(ctx, `
-        UPDATE conversations SET title = $1, updated_at = $2 WHERE id = $3
-    `, title, time.Now(), id)
-    return err
+	return r.es.Update(ctx, conversationsIndex, id, map[string]any{
+		"title":      title,
+		"updated_at": time.Now().UTC(),
+	})
 }
 
-// DELETE (hard delete — cascades to messages)
 func (r *Conversation) Delete(ctx context.Context, id string) error {
-    _, err := r.db.Exec(ctx, `DELETE FROM conversations WHERE id = $1`, id)
-    return err
+	return r.es.Delete(ctx, conversationsIndex, id)
+}
+
+type conversationSearchResponse struct {
+	Hits struct {
+		Hits []struct {
+			Source models.Conversation `json:"_source"`
+		} `json:"hits"`
+	} `json:"hits"`
 }
