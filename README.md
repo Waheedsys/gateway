@@ -1,240 +1,239 @@
 # AI Gateway
 
-A high-performance, lightweight LLM gateway for multi-turn conversations, log ingestion, and analytics. Built in Go, it features native Server-Sent Events (SSE) streaming, a non-blocking event-driven architecture, Redis-based rate limiting, and robust containerization.
+A lightweight Go LLM gateway for multi-turn conversations, Elasticsearch-backed memory, SSE streaming, provider abstraction, MCP tool calling, Redis response caching, and inference observability.
 
----
+## Features
 
-## Architecture Overview
+- Multi-turn conversation API with persisted user and assistant messages
+- Elasticsearch document storage for conversations, messages, and inference logs
+- Context assembly from recent chat history plus Elasticsearch full-text retrieval
+- OpenRouter and Anthropic provider support behind a common interface
+- Streaming and non-streaming inference responses
+- Redis-backed short-lived inference response cache
+- In-process event bus for asynchronous inference log persistence
+- External inference log ingestion endpoint
+- 24-hour inference statistics endpoint
+- Optional stdio MCP server integration for tool discovery, direct tool calls, and inline tool context
+- Kibana service for inspecting Elasticsearch documents locally
+- JWT auth and Redis rate-limit middleware packages are included, but not currently wired into `cmd/gateway/main.go`
 
-The gateway is built around a decoupled, resilient architecture where client responsiveness is prioritized.
+## Architecture
 
-```
-                  ┌────────────────────────────────────────────────────────┐
-                  │                    Client Request                      │
-                  └──────────────────────────┬─────────────────────────────┘
-                                             │ POST /conversations/{id}/infer
-                                             ▼
-                                ┌─────────────────────────┐
-                                │   Inference Endpoint    │
-                                └──────┬────────────┬─────┘
-                                       │            │
-             If stream=true (SSE path) │            │ If stream=false (Blocking path)
-                                       ▼            ▼
-             ┌───────────────────────────┐        ┌───────────────────────────┐
-             │ Immediate SSE Connection  │        │   Wait for LLM response   │
-             │ (Flushes start/text/done) │        │   and return full JSON    │
-             └─────────────┬─────────────┘        └─────────────┬─────────────┘
-                           │                                    │
-                           │     Publish event asynchronously   │
-                           └─────────────┐        ┌─────────────┘
-                                         │        │
-                                         ▼        ▼
-                               ┌─────────────────────────┐
-                               │  In-Process Event Bus   │
-                               │  (Go Buffered Channel)  │
-                               └────────────┬────────────┘
-                                            │
-                                            │ Dispatched to
-                                            ▼
-                               ┌─────────────────────────┐
-                               │   Database Subscriber   │
-                               │   (Async DB Write)      │
-                               └────────────┬────────────┘
-                                            │
-                                            ▼
-                               ┌─────────────────────────┐
-                               │      PostgreSQL DB      │
-                               │    (inference_logs)     │
-                               └─────────────────────────┘
+```text
+Client
+  -> Go Gateway
+      -> Elasticsearch
+          - conversations
+          - messages
+          - inference_logs
+          - BM25-style message retrieval
+      -> Redis
+          - short-lived inference response cache
+      -> Event Bus
+          - async success/error inference log writes
+      -> MCP server
+          - optional stdio tool discovery and tool execution
+      -> LLM provider
+          - OpenRouter or Anthropic
 ```
 
-### Key Technical Achievements
+The gateway stores each conversation, message, and inference log as an Elasticsearch document. During inference, it builds the model prompt dynamically from recent conversation history, relevant messages found through Elasticsearch full-text search, and optional MCP tool output.
 
-1. **Native Server-Sent Events (SSE) Streaming**: Supports real-time client interaction by proxying, parsing, and streaming chunks back to the client immediately using `text/event-stream` with chunk-by-chunk HTTP flushing.
-2. **Non-Blocking Event-Driven Persistence**: Eliminates database query latency from the client's request path. HTTP handlers drop event payloads onto a buffered channel in the `events.Bus`. A background goroutine consumes these events to save logs asynchronously.
-3. **Defense-in-Depth Concurrency**: Utilizes non-blocking select-default channel publishers so that if the queue becomes completely filled (e.g. during an extreme spike), it falls back to dropping log events rather than freezing incoming client requests. A custom panic recovery defer statement ensures that sub-routine failures never crash the parent server process.
-4. **Clean Provider Interfaces**: Highly modular LLM provider abstractions (`providers.Provider` interface) supporting custom token calculation, metadata mapping, and raw response payloads (implemented for **OpenRouter** and **Anthropic**).
+## Context Flow
 
----
+When `POST /conversations/{id}/infer` is called, the gateway:
 
-## Setup & Deployment
+1. Stores the incoming user message in the `messages` index.
+2. Loads the latest 8 messages from the same conversation.
+3. Searches the same conversation for the top 5 relevant messages using Elasticsearch `match` on `content`.
+4. Optionally detects an inline MCP tool call such as `tool:read_file {...}` and adds the tool result.
+5. Builds a prompt containing retrieved context, tool context, recent messages, and the final `assistant:` marker.
+6. Calls the selected provider.
+7. Stores the assistant response in the `messages` index.
+8. Publishes an inference success or failure event.
+9. Persists the inference log asynchronously into `inference_logs`.
 
-The repository comes fully containerized and configured for local development or production-like environments.
+Current retrieval is text/BM25 based. Vector embeddings are not required for the current implementation, but they would be a natural future upgrade for semantic recall.
 
-### Option A: Running with Docker (Recommended)
+## Setup
 
-To run the entire ecosystem (Go API + Postgres + Redis) with a single command:
+Create or update `.env`:
 
-1. **Verify your `.env` configuration** or copy it:
-   ```env
-   DATABASE_URL=postgres://postgres:postgres@postgres:5432/ai_gateway?sslmode=disable
-   REDIS_ADDR=redis:6379
-   MIGRATIONS_PATH=./migrations
-   JWT_SECRET=supersecretjwtkey123!
-   LLM_PROVIDER=openrouter
-   OPENROUTER_API_KEY=your_key_here
-   ```
+```env
+ELASTICSEARCH_URL=http://localhost:9200
+REDIS_ADDR=localhost:6379
+JWT_SECRET=supersecretjwtkey123!
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=your-openrouter-key
+ANTHROPIC_API_KEY=
+MCP_SERVER_COMMAND=
+CACHE_TTL=5m
+```
 
-2. **Build and spin up the Docker stack**:
-   ```bash
-   docker compose up -d --build
-   ```
+Supported `LLM_PROVIDER` values:
 
-3. **Verify running containers and health checks**:
-   ```bash
-   docker compose ps
-   ```
-   Postgres and Redis carry automated health checks (`pg_isready` and `redis-cli ping` respectively). The gateway will wait to boot until they are reported healthy.
+```text
+openrouter
+anthropic
+```
 
-### Option B: Running Locally
+Run the full local stack:
 
-If you prefer to run the database & cache inside containers but run the Go process locally:
+```bash
+docker compose up -d --build
+```
 
-1. **Launch dependencies**:
-   ```bash
-   docker compose up -d postgres redis
-   ```
+Run only dependencies and start Go locally:
 
-2. **Configure `.env` for local access**:
-   ```env
-   DATABASE_URL=postgres://postgres:postgres@localhost:5433/ai_gateway?sslmode=disable
-   REDIS_ADDR=localhost:6379
-   MIGRATIONS_PATH=./migrations
-   JWT_SECRET=supersecretjwtkey123!
-   LLM_PROVIDER=openrouter
-   OPENROUTER_API_KEY=your-openrouter-key
-   ```
+```bash
+docker compose up -d elasticsearch redis kibana
+go run ./cmd/gateway
+```
 
-3. **Run the API**:
-   ```bash
-   go run ./cmd/gateway
-   ```
-   *Note: Database schema migrations run automatically at startup!*
+The gateway creates required Elasticsearch indexes automatically at startup.
 
----
+## Local Services
 
-## Authentication
+| Service | URL | Purpose |
+| --- | --- | --- |
+| Gateway | `http://localhost:8080` | API server |
+| Elasticsearch | `http://localhost:9200` | Document storage and context retrieval |
+| Kibana | `http://localhost:5601` | Elasticsearch inspection UI |
+| Redis | `localhost:6379` | Inference response cache |
 
-Protected endpoints require a bearer JWT signed with the defined `JWT_SECRET`. 
+## Elasticsearch Indexes
 
-Generate a token for local testing by running:
+Indexes are created by `EnsureIndexes` during gateway startup.
+
+| Index | Purpose |
+| --- | --- |
+| `conversations` | Conversation title, status, and timestamps |
+| `messages` | User, assistant, and system messages |
+| `inference_logs` | Provider, model, latency, token usage, status, previews, and raw metadata |
+
+Documents are written with `PUT /{index}/_doc/{id}?refresh=true`, so newly created messages are immediately searchable in local development.
+
+## MCP Tool Calling
+
+Set `MCP_SERVER_COMMAND` to a stdio MCP server command. Example:
+
+```env
+MCP_SERVER_COMMAND=npx -y @modelcontextprotocol/server-filesystem C:\tmp
+```
+
+List tools:
+
+```bash
+curl.exe http://localhost:8080/mcp/tools
+```
+
+Call a tool directly:
+
+```bash
+curl.exe -X POST http://localhost:8080/mcp/tools/call ^
+  -H "Content-Type: application/json" ^
+  -d "{\"name\":\"read_file\",\"arguments\":{\"path\":\"C:\\tmp\\note.txt\"}}"
+```
+
+Call a tool inside inference by prefixing the user message:
+
+```json
+{
+  "content": "tool:read_file {\"path\":\"C:\\tmp\\note.txt\"}",
+  "stream": false
+}
+```
+
+The gateway calls the MCP tool, adds the result to the model context, then asks the configured LLM provider to answer.
+
+## API Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Health check |
+| `POST` | `/conversations` | Create a conversation |
+| `GET` | `/conversations` | List conversations |
+| `GET` | `/conversations/{id}` | Load conversation state |
+| `POST` | `/conversations/{id}/cancel` | Mark a conversation as cancelled |
+| `GET` | `/conversations/{id}/messages` | List conversation messages |
+| `POST` | `/conversations/{id}/messages` | Add a message manually |
+| `POST` | `/conversations/{id}/infer` | Store user message, build context, call provider, store assistant message |
+| `GET` | `/conversations/{id}/inference-logs` | List inference logs for one conversation |
+| `POST` | `/ingest/inference-logs` | Ingest external inference logs |
+| `GET` | `/inference/stats` | Get 24-hour inference stats |
+| `GET` | `/mcp/tools` | List MCP tools |
+| `POST` | `/mcp/tools/call` | Call one MCP tool |
+
+## Example Requests
+
+Create a conversation:
+
+```bash
+curl.exe -X POST http://localhost:8080/conversations ^
+  -H "Content-Type: application/json" ^
+  -d "{\"title\":\"Gateway demo\"}"
+```
+
+Run non-streaming inference:
+
+```bash
+curl.exe -X POST http://localhost:8080/conversations/CONVERSATION_ID/infer ^
+  -H "Content-Type: application/json" ^
+  -d "{\"content\":\"Remember that our preferred database is Elasticsearch.\",\"model\":\"openrouter/free\",\"stream\":false}"
+```
+
+Run streaming inference:
+
+```bash
+curl.exe -X POST http://localhost:8080/conversations/CONVERSATION_ID/infer ^
+  -H "Content-Type: application/json" ^
+  -d "{\"content\":\"What database did I prefer?\",\"stream\":true}"
+```
+
+## Streaming
+
+When `/conversations/{id}/infer` is called with `"stream": true`, the gateway returns `text/event-stream` chunks:
+
+```text
+data: {"event":"start","user_message":{...}}
+data: {"event":"text","text":"partial text"}
+data: {"event":"done","assistant_message":{...}}
+```
+
+Cached responses are also returned as SSE when streaming is requested. The gateway emits the cached text in small chunks and still stores an assistant message for the turn.
+
+## Inference Logs And Stats
+
+Successful and failed provider calls publish events to an in-process event bus. A background subscriber persists those events into the `inference_logs` Elasticsearch index.
+
+External services can also write compatible logs:
+
+```bash
+curl.exe -X POST http://localhost:8080/ingest/inference-logs ^
+  -H "Content-Type: application/json" ^
+  -d "{\"provider\":\"external\",\"model\":\"demo\",\"status\":\"success\",\"latency_ms\":120,\"input_preview\":\"hello\",\"output_preview\":\"world\"}"
+```
+
+Get 24-hour stats:
+
+```bash
+curl.exe http://localhost:8080/inference/stats
+```
+
+## Authentication Note
+
+The repository includes JWT helpers in `internal/auth` and a Redis token-bucket middleware in `internal/ratelimiter`. The current gateway router does not attach these middleware, so the listed API endpoints run without auth in the present code path.
+
+You can still generate a local JWT for development experiments:
+
 ```bash
 go run ./cmd/gentoken
 ```
 
-Send the resulting token in the request header:
-```text
-Authorization: Bearer <token>
-```
+## Notes
 
----
-
-## Core API Endpoints
-
-| Method | Path | Auth Required | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/health` | No | Health check |
-| `POST` | `/conversations` | Yes | Create a new conversation |
-| `GET` | `/conversations` | Yes | List all conversations |
-| `GET` | `/conversations/{id}` | Yes | Load conversation state |
-| `POST` | `/conversations/{id}/cancel`| Yes | Mark conversation as cancelled (blocks further inference) |
-| `GET` | `/conversations/{id}/messages`| Yes | List all chat messages in a conversation |
-| `POST` | `/conversations/{id}/infer` | Yes | Store user message, invoke LLM, stream back or block-return assistant reply, publish log event |
-| `GET` | `/conversations/{id}/inference-logs` | Yes | List logged inference cycles for this conversation |
-| `POST` | `/ingest/inference-logs` | Yes | Ingest analytics logs from external SDKs/wrappers |
-| `GET` | `/inference/stats` | Yes | Get historical summary metrics (avg latency, token count, errors) |
-
----
-
-## Features & Deep Dives
-
-### 1. Server-Sent Events (SSE) Streaming
-
-When invoking the inference endpoint `/conversations/{id}/infer` with `stream: true`, the gateway returns a standard EventSource-compatible chunked stream. 
-
-**Response Event Stream Flow:**
-- **`event: start`**: Emitted immediately with the created `user_message` object.
-- **`event: text`**: Emitted repeatedly as characters stream back from the LLM provider, providing low-latency interaction.
-- **`event: done`**: Emitted when the stream terminates safely, providing the fully persisted `assistant_message` database object.
-- **`event: error`**: Emitted in the event of an upstream provider drop or database writing failure.
-
-#### Sample Streaming Request
-```bash
-curl.exe -X POST http://localhost:8080/conversations/YOUR_CONVERSATION_ID/infer \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"content\":\"Explain quantum computing in one sentence.\",\"stream\":true}"
-```
-
-#### Sample Streaming Response
-```text
-data: {"event":"start","user_message":{"id":"...","conversation_id":"...","role":"user","content":"Explain quantum...","created_at":"..."}}
-
-data: {"event":"text","text":"Quantum"}
-
-data: {"event":"text","text":" computing"}
-
-...
-
-data: {"event":"done","assistant_message":{"id":"...","conversation_id":"...","role":"assistant","content":"Quantum computing uses subatomic particles to process complex math at super speeds.","created_at":"..."}}
-```
-
----
-
-### 2. Go Channel-Based Event Bus
-
-To keep inference response times as short as possible, logging is decoupled from the HTTP response thread. 
-
-- **Buffered Go Channel**: The event bus maintains a buffer of size `100` (`events.NewBus(100)`).
-- **Graceful Backpressure Management**: Publishers use Go's non-blocking `select` write. If the channel fills completely, the message is gracefully dropped, and a warning is logged. This protects application uptime during severe database bottlenecks.
-- **Subscriber Protection**: Subscribers run inside dedicated goroutines. A deferred `recover()` block wraps the subscriber execution context to prevent a sudden runtime panic from taking down the web server.
-
----
-
-### 3. Redis Rate Limiting
-
-The application applies a custom Token Bucket middleware utilizing Redis. Each client API key has a rate limit applied dynamically:
-- Prevents DDoS attacks and LLM provider credit exhaustion.
-- Features automatic sliding TTLs and token replenishing.
-
----
-
-### 4. Database Schema & Persistence
-
-The relational database is configured to survive data cleanup safely:
-- **Conversations**: Manages state (e.g. `cancelled` to restrict further chat operations).
-- **Messages**: Holds conversation histories. Uses `ON DELETE CASCADE` to clean up messages when their parent conversation is removed.
-- **Inference Logs**: Keeps detailed analytics tracking latency, status (`success` / `error`), model parameters, and raw vendor metadata (`JSONB`). Connects via `ON DELETE SET NULL` to keep valuable metrics even if conversations/messages are pruned.
-
----
-
-## Containerization Architecture
-
-The project's `dockerfile` follows modern container best practices for minimal image sizes and enhanced security:
-
-```
-  Stage 1: Statically Build Binary                  Stage 2: Minimal Distroless Alpine
-┌─────────────────────────────────┐               ┌──────────────────────────────────┐
-│  FROM golang:1.26-alpine        │               │  FROM alpine:3.20                │
-│                                 │               │                                  │
-│  - Install git                  │               │  - Install ca-certificates      │
-│  - Cache go.mod & go.sum        │               │  - Add non-root "gateway" user   │
-│  - Copy source code             │               │  - COPY compiled binary          │
-│  - Build statically linked app  ├───────────────┼─▶ - COPY migrations/             │
-│    (CGO_ENABLED=0 GOOS=linux)   │               │  - USER gateway (security!)      │
-│    Size: ~750MB                 │               │  Final size: ~20MB               │
-└─────────────────────────────────┘               └──────────────────────────────────┘
-```
-
-- **Outbound Outcall Certificates**: Stage 2 installs `ca-certificates` to support HTTPS calls to upstream providers.
-- **Rootless Security**: Runs as the custom user `gateway` so the container process has zero access to default system processes.
-- **Build Caching**: Dependencies are resolved separately from source changes to keep incremental local container rebuilds under 2 seconds.
-
----
-
-## Future Roadmap & Improvements
-
-- **Global Metrics Dashboard**: A visualization suite to map gateway analytics (error spikes, average token costs, and average provider response latency).
-- **PII Redaction Engine**: Advanced regex and Named Entity Recognition (NER) filters to scrub credit cards, phone numbers, and keys before persisting logs to `inference_logs`.
-- **Ingestion Failover Queues**: Dead-Letter Queues (DLQ) or Apache Kafka support for bulk `/ingest/inference-logs` to support enterprise-grade backpressure.
-- **Provider Retry & Failover**: Automatic fallback to alternative models/vendors if an upstream service (e.g., OpenRouter) encounters 5xx error rates.
+- PostgreSQL has been removed from the runtime path.
+- Elasticsearch is the source of truth for conversations, messages, and inference logs.
+- Message relevance search currently uses Elasticsearch full-text search, not embeddings.
+- Redis is used for short-lived inference response caching through `CACHE_TTL`.
+- MCP support is stdio-based and configured through `MCP_SERVER_COMMAND`.

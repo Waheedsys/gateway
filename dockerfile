@@ -36,9 +36,6 @@ WORKDIR /app
 # Copy compiled binary
 COPY --from=builder /gateway ./gateway
 
-# Copy SQL migration files (the app applies them on startup via ApplyMigrations)
-COPY --from=builder /app/migrations ./migrations
-
 # Ensure the binary is executable and owned by the runtime user
 RUN chown -R gateway:gateway /app
 USER gateway

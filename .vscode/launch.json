@@ -9,6 +9,16 @@
       "program": "${workspaceFolder}/cmd/gateway",
       "envFile": "${workspaceFolder}/.env",
       "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Debug Test MCP Server",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/testmcp",
+      "cwd": "${workspaceFolder}",
+      "args": ["C:\\tmp"],
+      "envFile": "${workspaceFolder}/.env"
     }
   ]
 }
