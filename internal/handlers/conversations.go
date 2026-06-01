@@ -217,12 +217,18 @@ func (h *ConversationHandler) RunInference(w http.ResponseWriter, r *http.Reques
 	}
 
 	toolContext, toolMetadata := h.tryMCPToolCall(r, req.Content)
-	prompt := buildContextPrompt(history, relevant, toolContext)
+	history = excludeMessage(history, userMessage.ID)
+	relevant = dedupeRelevantContext(history, relevant, userMessage.ID)
+	prompt := buildContextPrompt(history, relevant, toolContext, *userMessage)
 	requestedAt := time.Now().UTC()
 
 	// Compute cache key
 	hasher := sha256.New()
-	hasher.Write([]byte(req.Model + ":" + req.Content))
+	hasher.Write([]byte(req.Model))
+	hasher.Write([]byte(":"))
+	hasher.Write([]byte(conversationID))
+	hasher.Write([]byte(":"))
+	hasher.Write([]byte(prompt))
 	cacheKey := "cache:inference:" + hex.EncodeToString(hasher.Sum(nil))
 
 	var cachedResponse string
@@ -718,33 +724,124 @@ func parseInlineToolCall(content string) (mcpclient.ToolCall, bool) {
 	return mcpclient.ToolCall{}, false
 }
 
-func buildContextPrompt(messages []models.Message, relevant []models.Message, toolContext string) string {
+const (
+	maxRetrievedChars = 4000
+	maxToolChars      = 3000
+	maxHistoryChars   = 3500
+	maxMessageChars   = 1500
+)
+
+func excludeMessage(messages []models.Message, excludedID string) []models.Message {
+	if excludedID == "" {
+		return messages
+	}
+
+	filtered := make([]models.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.ID == excludedID {
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	return filtered
+}
+
+func dedupeRelevantContext(history []models.Message, relevant []models.Message, currentID string) []models.Message {
+	seen := map[string]bool{}
+	for _, msg := range history {
+		seen[msg.ID] = true
+	}
+	if currentID != "" {
+		seen[currentID] = true
+	}
+
+	deduped := make([]models.Message, 0, len(relevant))
+	for _, msg := range relevant {
+		if seen[msg.ID] {
+			continue
+		}
+		seen[msg.ID] = true
+		deduped = append(deduped, msg)
+	}
+	return deduped
+}
+
+func buildContextPrompt(messages []models.Message, relevant []models.Message, toolContext string, current models.Message) string {
 	var b strings.Builder
 	b.WriteString("You are a helpful assistant. Continue this conversation using the recent context.\n\n")
+
 	if len(relevant) > 0 {
 		b.WriteString("Relevant retrieved context from Elasticsearch:\n")
+		used := 0
 		for _, msg := range relevant {
+			content := truncatePromptText(msg.Content, maxMessageChars)
+			if used+len(content) > maxRetrievedChars {
+				break
+			}
+			used += len(content)
+
 			b.WriteString("- ")
 			b.WriteString(string(msg.Role))
 			b.WriteString(": ")
-			b.WriteString(msg.Content)
+			b.WriteString(content)
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
 	}
+
 	if strings.TrimSpace(toolContext) != "" {
 		b.WriteString("Tool context:\n")
-		b.WriteString(toolContext)
+		b.WriteString(truncatePromptText(toolContext, maxToolChars))
 		b.WriteString("\n\n")
 	}
-	for _, msg := range messages {
+
+	for _, msg := range budgetRecentMessages(messages, maxHistoryChars) {
 		b.WriteString(string(msg.Role))
 		b.WriteString(": ")
-		b.WriteString(msg.Content)
+		b.WriteString(truncatePromptText(msg.Content, maxMessageChars))
 		b.WriteString("\n")
 	}
+
+	b.WriteString(string(current.Role))
+	b.WriteString(": ")
+	b.WriteString(truncatePromptText(current.Content, maxMessageChars))
+	b.WriteString("\n")
 	b.WriteString("\nassistant:")
+
 	return b.String()
+}
+
+func budgetRecentMessages(messages []models.Message, maxChars int) []models.Message {
+	if maxChars <= 0 {
+		return nil
+	}
+
+	used := 0
+	var keptReversed []models.Message
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		content := truncatePromptText(msg.Content, maxMessageChars)
+		cost := len(string(msg.Role)) + len(content) + 3
+		if used+cost > maxChars {
+			break
+		}
+		used += cost
+		keptReversed = append(keptReversed, msg)
+	}
+
+	kept := make([]models.Message, len(keptReversed))
+	for i := range keptReversed {
+		kept[len(keptReversed)-1-i] = keptReversed[i]
+	}
+	return kept
+}
+
+func truncatePromptText(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return value[:max] + "\n[truncated]"
 }
 
 func withMCPMetadata(raw map[string]any, mcp map[string]any) map[string]any {
