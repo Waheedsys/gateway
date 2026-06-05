@@ -1,6 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.DS_Store
+*.log
 .env
-# Go debug binaries and executables
-_debug_bin*
-__debug_bin*
-*.exe
-*.exe~
