@@ -49,11 +49,11 @@ services:
     environment:
       ELASTICSEARCH_URL: http://elasticsearch:9200
       REDIS_ADDR: redis:6379
-      JWT_SECRET: ${JWT_SECRET:-supersecretjwtkey123!}
       LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       MCP_SERVER_COMMAND: ${MCP_SERVER_COMMAND:-}
+      CACHE_TTL: ${CACHE_TTL:-5m}
     depends_on:
       elasticsearch:
         condition: service_healthy

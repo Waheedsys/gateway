@@ -1,19 +1,19 @@
-# Git
-.git
-.gitignore
-
-# IDE / editor
-.vscode
-*.code-workspace
-
-# Local env (secrets are injected via docker-compose environment)
 .env
-
-# Build artefacts
-bin/
-**/__debug_bin.exe
-**/*.exe
-
-# OS noise
-Thumbs.db
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.log
 .DS_Store
+go_version/
+bin/
+tools/
+docs/
+*.md
