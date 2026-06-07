@@ -4,6 +4,8 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 from elasticsearch import AsyncElasticsearch, NotFoundError
 
+from embeddings import get_embedding
+
 ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200").rstrip("/")
 
 es_client: Optional[AsyncElasticsearch] = None
@@ -47,6 +49,12 @@ async def ensure_indexes():
                     "conversation_id": {"type": "keyword"},
                     "role": {"type": "keyword"},
                     "content": {"type": "text"},
+                     "embedding": {
+                        "type": "dense_vector",
+                        "dims": 384,          # match your embedding model's output dims
+                        "index": True,         # enables kNN search
+                        "similarity": "cosine"
+                    },
                     "created_at": {"type": "date"}
                 }
             }
@@ -128,25 +136,66 @@ async def cancel_conversation(doc_id: str) -> bool:
     except NotFoundError:
         return False
 
+
+async def find_or_create_message(conversation_id: str, role: str, content: str, idempotency_window_seconds: int = 30) -> tuple[Dict[str, Any], bool]:
+    """
+    Returns (message, created).
+    If an identical message exists within the window, returns it instead of creating a new one.
+    """
+    client = get_db()
+    window_start = (datetime.now(timezone.utc) - timedelta(seconds=idempotency_window_seconds)).isoformat()
+    
+    # Check for duplicate within time window
+    res = await client.search(index="messages", body={
+        "size": 1,
+        "sort": [{"created_at": {"order": "desc"}}],
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"conversation_id": conversation_id}},
+                    {"term": {"role": role}},
+                    {"range": {"created_at": {"gte": window_start}}}
+                ],
+                "must": [
+                    {"match_phrase": {"content": content}}
+                ]
+            }
+        }
+    })
+    
+    hits = res["hits"]["hits"]
+    if hits:
+        existing = {k: v for k, v in hits[0]["_source"].items() if k != "embedding"}
+        return existing, False   # already exists, not created
+    
+    # No duplicate found — create fresh
+    msg = await create_message(conversation_id, role, content)
+    return msg, True             # newly created
+
+
 # --- Message Repository ---
 
 async def create_message(conversation_id: str, role: str, content: str) -> Dict[str, Any]:
     client = get_db()
     doc_id = new_id()
     now = datetime.now(timezone.utc).isoformat()
+    embedding = await get_embedding(content)
     doc = {
         "id": doc_id,
         "conversation_id": conversation_id,
         "role": role,
         "content": content,
+        "embedding": embedding, 
         "created_at": now
     }
     await client.index(index="messages", id=doc_id, document=doc, refresh="true")
-    return doc
+    doc_without_embedding = {k: v for k, v in doc.items() if k != "embedding"}
+    return doc_without_embedding
 
 async def list_messages(conversation_id: str) -> List[Dict[str, Any]]:
     client = get_db()
     query = {
+        "_source": {"excludes": ["embedding"]},
         "size": 500,
         "sort": [{"created_at": {"order": "asc"}}],
         "query": {
@@ -160,6 +209,7 @@ async def get_last_n_messages(conversation_id: str, n: int) -> List[Dict[str, An
     client = get_db()
     query = {
         "size": n,
+        "_source": {"excludes": ["embedding"]},
         "sort": [{"created_at": {"order": "desc"}}],
         "query": {
             "term": {"conversation_id": conversation_id}
@@ -172,16 +222,18 @@ async def get_last_n_messages(conversation_id: str, n: int) -> List[Dict[str, An
 
 async def search_relevant_messages(conversation_id: str, query_str: str, n: int) -> List[Dict[str, Any]]:
     client = get_db()
+    query_vector = await get_embedding(query_str)
+     # Hybrid: BM25 + kNN fused via RRF (Elasticsearch 8.9+)
     query = {
         "size": n,
-        "query": {
-            "bool": {
-                "filter": [
-                    {"term": {"conversation_id": conversation_id}}
-                ],
-                "must": [
-                    {"match": {"content": query_str}}
-                ]
+        "_source": {"excludes": ["embedding"]},
+        "knn": {
+            "field": "embedding",
+            "query_vector": query_vector,
+            "k": n,
+            "num_candidates": n * 10,
+            "filter": {
+                "term": {"conversation_id": conversation_id}
             }
         }
     }

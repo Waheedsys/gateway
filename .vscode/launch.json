@@ -3,22 +3,38 @@
   "configurations": [
     {
       "name": "Debug Gateway",
-      "type": "go",
+      "type": "debugpy",
       "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/cmd/gateway",
+      "module": "uvicorn",
+      "args": [
+        "main:app",        // 👈 change to your actual module path
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--reload"
+      ],
       "envFile": "${workspaceFolder}/.env",
-      "cwd": "${workspaceFolder}"
+      "cwd": "${workspaceFolder}",
+      "jinja": true,
+      "justMyCode": true
     },
     {
       "name": "Debug Test MCP Server",
-      "type": "go",
+      "type": "debugpy",
       "request": "launch",
-      "mode": "debug",
-      "program": "${workspaceFolder}/cmd/testmcp",
-      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/cmd/testmcp/main.py",  // 👈 change to your MCP entry point
       "args": ["C:\\tmp"],
-      "envFile": "${workspaceFolder}/.env"
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "Debug Current File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
     }
   ]
 }

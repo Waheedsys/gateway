@@ -8,10 +8,11 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
-
+from dotenv import load_dotenv
+load_dotenv()
 from db import (
     ensure_indexes, close_db,
-    create_conversation, get_conversation, list_conversations, cancel_conversation,
+    create_conversation, find_or_create_message, get_conversation, list_conversations, cancel_conversation,
     create_message, list_messages, get_last_n_messages, search_relevant_messages,
     create_inference_log, list_inference_logs, get_stats_24h
 )
@@ -256,7 +257,10 @@ async def run_inference(conversation_id: str, req: InferenceRequest):
         model = "claude-3-5-sonnet-20241022" if provider == "anthropic" else "openrouter/free"
         
     # Store user message
-    user_message = await create_message(conversation_id, "user", content)
+    # user_message = await create_message(conversation_id, "user", content)
+    user_message, created = await find_or_create_message(conversation_id, "user", content)
+    if not created:
+        logger.info(f"Reusing existing user message {user_message['id']} (retry detected)")
     
     # Retrieve context
     history = await get_last_n_messages(conversation_id, 8)
@@ -266,18 +270,40 @@ async def run_inference(conversation_id: str, req: InferenceRequest):
     relevant = await search_relevant_messages(conversation_id, content, 5)
     
     # Deduplicate relevant context
-    seen_ids = {m["id"] for m in history}
+    seen_ids = {m["id"] for m in history} | {user_message["id"]}
     relevant = [m for m in relevant if m["id"] not in seen_ids]
     
     # Build Elasticsearch retrieved context prompt
-    system_prompt = "You are a helpful assistant. Continue this conversation using the recent context.\n\n"
-    if relevant:
-        system_prompt += "Relevant retrieved context from Elasticsearch:\n"
-        for msg in relevant:
-            role = msg["role"]
-            text = msg["content"][:1500]
-            system_prompt += f"- {role}: {text}\n"
-        system_prompt += "\n"
+    # system_prompt = "You are a helpful assistant. Continue this conversation using the recent context.\n\n"
+    system_prompt = """You are an SQF Quality System assistant. Your role is to help users understand and implement the SQF Quality Code requirements.
+
+    QUALITY POLICY FRAMEWORK:
+    2.1.1.1 - Food Quality Policy Requirements:
+    - Supply product in compliance with all customer, regulatory, and internal quality requirements
+    - Establish and maintain the site's quality performance
+    - Establish and continually improve the site's food quality management system
+    - Effectively communicate this policy to all personnel in a language(s) they understand
+
+    2.1.1.2 - Quality Culture Requirements:
+    - Quality practices and all applicable SQF Quality Code requirements are implemented and maintained
+    - Personnel are informed and held accountable for their SQF Quality Code responsibilities
+    - Personnel are encouraged to notify management about actual or potential quality issues
+    - Personnel are empowered to act to resolve quality deviations within their scope of work
+
+    2.1.1.3 - Quality Objectives & Reporting Structure:
+    - Establish, document, and communicate quality objectives and performance measures
+    - Document job functions for key personnel whose activities affect quality
+    - Identify backups for key personnel
+    - Ensure integrity of the quality system during organizational or personnel changes
+
+    2.1.1.4 - SQF Quality Practitioner Requirements:
+    - Oversee development, implementation, review, and maintenance of the SQF Quality System
+    - Take appropriate action to ensure SQF Quality System integrity
+    - Communicate essential information to relevant personnel
+    - Ensure proper use of the SQF Quality Shield per Rules of Use
+    - Must be employed at the site and competent in quality management
+
+    Continue this conversation using the recent context.\n\n"""
         
     # Compute Redis cache key
     # Simple hash of prompt structure to matches Go logic
@@ -329,7 +355,7 @@ async def run_inference(conversation_id: str, req: InferenceRequest):
     requested_at = datetime.now(timezone.utc)
     try:
         assistant_text, usage, raw_metadata = await run_agent(
-            model, system_prompt, history, content, mcp_client
+            model, system_prompt, history, relevant, content, mcp_client
         )
         responded_at = datetime.now(timezone.utc)
         latency_ms = int((responded_at - requested_at).total_seconds() * 1000)
