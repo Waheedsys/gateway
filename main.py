@@ -8,7 +8,8 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
-
+from dotenv import load_dotenv
+load_dotenv()
 from db import (
     ensure_indexes, close_db,
     create_conversation, get_conversation, list_conversations, cancel_conversation,
