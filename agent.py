@@ -36,9 +36,44 @@ def get_llm(model_name: str):
             }
         )
 
-def build_langchain_messages(system_prompt: str, history: List[Dict[str, Any]], current_user_msg: str) -> List[BaseMessage]:
+# def build_langchain_messages(system_prompt: str, history: List[Dict[str, Any]], current_user_msg: str) -> List[BaseMessage]:
+#     messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
+    
+#     for msg in history:
+#         role = msg.get("role")
+#         content = msg.get("content", "")
+#         if role == "user":
+#             messages.append(HumanMessage(content=content))
+#         elif role == "assistant":
+#             messages.append(AIMessage(content=content))
+#         elif role == "system":
+#             messages.append(SystemMessage(content=content))
+            
+#     messages.append(HumanMessage(content=current_user_msg))
+#     return messages
+
+def build_langchain_messages(
+    system_prompt: str,
+    relevant: List[Dict[str, Any]],      # ✅ new param
+    history: List[Dict[str, Any]],
+    current_user_msg: str
+) -> List[BaseMessage]:
     messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
     
+    # Semantic context as real message turns, not raw text
+    if relevant:
+        messages.append(SystemMessage(
+            content="The following are relevant messages from earlier in this conversation:"
+        ))
+        for msg in relevant:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+
+    # Recent history (chronological)
     for msg in history:
         role = msg.get("role")
         content = msg.get("content", "")
@@ -48,7 +83,8 @@ def build_langchain_messages(system_prompt: str, history: List[Dict[str, Any]], 
             messages.append(AIMessage(content=content))
         elif role == "system":
             messages.append(SystemMessage(content=content))
-            
+
+    # Current user turn
     messages.append(HumanMessage(content=current_user_msg))
     return messages
 
@@ -85,6 +121,7 @@ async def get_langchain_tools(mcp_client: MCPClient) -> List[StructuredTool]:
 async def run_agent(
     model_name: str,
     system_prompt: str,
+    relevant: List[Dict[str, Any]],
     history: List[Dict[str, Any]],
     user_message: str,
     mcp_client: MCPClient
@@ -99,7 +136,7 @@ async def run_agent(
     # Create the ReAct agent
     agent = create_react_agent(llm, tools)
     
-    messages = build_langchain_messages(system_prompt, history, user_message)
+    messages = build_langchain_messages(system_prompt, relevant, history, user_message) 
     
     response = await agent.ainvoke({"messages": messages})
     
